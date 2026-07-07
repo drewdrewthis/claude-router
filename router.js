@@ -10,6 +10,8 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 
 const { decide } = require('./lib/decide');
 const { classify } = require('./lib/classify');
@@ -26,6 +28,11 @@ const DEFAULTS = {
   port: 3456,
 };
 
+// Upstream hosts we will ever send live credentials to. Anything else is a
+// fail-closed startup error: a redirected upstream would receive the caller's
+// Anthropic auth headers. Loopback stays allowed so local dev/tests work.
+const ALLOWED_UPSTREAM_HOSTS = ['api.anthropic.com', '127.0.0.1', 'localhost'];
+
 // Hop-by-hop headers we must not relay. content-length is recomputed by fetch/node.
 // On the response side we also drop content-encoding: global fetch transparently
 // decompresses the body, so a stale content-encoding would corrupt the client.
@@ -36,13 +43,71 @@ const HOP_RES = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'content-length', 'content-encoding',
 ]);
 
+// A generic Anthropic-style error envelope. We never echo internal error text to
+// the client (that could leak upstream/config detail); the real error is logged.
+function errorEnvelope(message) {
+  return JSON.stringify({ type: 'error', error: { type: 'api_error', message } });
+}
+
+function fatal(msg) {
+  console.error('[claude-router] FATAL: ' + msg);
+  process.exit(1);
+}
+
+// Deep-merge a partial config over DEFAULTS. `tiers` merges key-by-key so a user
+// who overrides only one tier keeps the other two.
+function mergeConfig(base) {
+  base = base || {};
+  return { ...DEFAULTS, ...base, tiers: { ...DEFAULTS.tiers, ...(base.tiers || {}) } };
+}
+
 function loadConfig(configPath) {
   const file = configPath || process.env.ROUTER_CONFIG || path.join(__dirname, 'config.json');
   try {
-    return { ...DEFAULTS, ...JSON.parse(fs.readFileSync(file, 'utf8')) };
+    return mergeConfig(JSON.parse(fs.readFileSync(file, 'utf8')));
   } catch {
-    return { ...DEFAULTS };
+    return mergeConfig({});
   }
+}
+
+// Fail-closed validation. Any violation exits the process — these are correctness
+// and security controls, not something to degrade past.
+function validateConfig(config) {
+  for (const label of ['light', 'standard', 'heavy']) {
+    const v = config.tiers && config.tiers[label];
+    if (typeof v !== 'string' || v.trim() === '') {
+      fatal(`config.tiers.${label} must resolve to a non-empty string (got ${JSON.stringify(v)}).`);
+    }
+  }
+
+  let host;
+  try {
+    host = new URL(config.upstream).hostname;
+  } catch {
+    fatal(`invalid upstream URL: ${JSON.stringify(config.upstream)}`);
+  }
+  const allowed = new Set([...ALLOWED_UPSTREAM_HOSTS, ...(config.allowedUpstreamHosts || [])]);
+  if (!allowed.has(host)) {
+    fatal(
+      `upstream host "${host}" is not allowlisted. Live credentials are only sent to ` +
+        `${[...allowed].join(', ')}. Add it to config.allowedUpstreamHosts if this is intentional.`
+    );
+  }
+  if (host !== 'api.anthropic.com') {
+    console.error(`[claude-router] NOTICE: forwarding to non-default upstream ${config.upstream}`);
+  }
+}
+
+function resolvePort(opts, config) {
+  let p;
+  if (opts.port != null) p = opts.port;
+  else if (process.env.ROUTER_PORT != null && process.env.ROUTER_PORT !== '') p = Number(process.env.ROUTER_PORT);
+  else p = config.port;
+  // 0 is the ephemeral-bind sentinel (used by tests); otherwise require 1-65535.
+  if (!Number.isInteger(p) || p < 0 || p > 65535) {
+    fatal(`invalid port ${JSON.stringify(p)} — must be an integer in 0..65535.`);
+  }
+  return p;
 }
 
 async function readBody(req) {
@@ -51,91 +116,100 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
-// Stream the upstream response back byte-for-byte, flushing each chunk as it
-// arrives (critical for SSE: first delta must reach the client before the
-// upstream finishes). Status + headers relayed verbatim minus hop-by-hop.
+// Stream the upstream response back byte-for-byte with backpressure + cleanup via
+// pipeline (critical for SSE: first delta reaches the client before upstream
+// finishes). May throw — the handler's try/catch owns error/abort recovery.
 async function forward(config, req, body, res) {
-  let upstream;
-  try {
-    const headers = {};
-    for (const [k, v] of Object.entries(req.headers)) if (!HOP_REQ.has(k)) headers[k] = v;
-    upstream = await fetch(config.upstream + req.url, {
-      method: req.method,
-      headers,
-      body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-    });
-  } catch (e) {
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end('claude-router upstream error: ' + String((e && e.message) || e));
-    return;
-  }
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP_REQ.has(k)) headers[k] = v;
+  const upstream = await fetch(config.upstream + req.url, {
+    method: req.method,
+    headers,
+    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
+  });
   const outHeaders = {};
   for (const [k, v] of upstream.headers) if (!HOP_RES.has(k)) outHeaders[k] = v;
   res.writeHead(upstream.status, outHeaders);
-  if (upstream.body) {
-    for await (const chunk of upstream.body) res.write(chunk);
-  }
-  res.end();
+  if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), res);
+  else res.end();
 }
 
 function makeHandler(config, cache, logger, fallbackTracker) {
   return async function handler(req, res) {
-    const rawBody = await readBody(req);
-    const pathname = new URL(req.url, 'http://x').pathname;
+    // Swallow client-side disconnects (ECONNRESET/EPIPE) so an aborted socket
+    // never surfaces as an unhandled 'error' event and crashes the process.
+    req.on('error', () => {});
+    res.on('error', () => {});
 
-    // Fast path (a): anything that is not exactly POST /v1/messages is a
-    // transparent, unlogged passthrough (count_tokens, GETs, etc.).
-    if (req.method !== 'POST' || pathname !== '/v1/messages') {
-      return forward(config, req, rawBody, res);
-    }
-
-    let decision;
     try {
-      decision = await decide({
-        rawBody,
-        config,
-        classify: (digest) => classify({ digest, config, incomingHeaders: req.headers }),
-        now: Date.now,
-        cache,
-      });
-    } catch (e) {
-      decision = {
-        routedModel: null,
-        rewrite: false,
-        log: {
-          key: null,
-          original_model: null,
-          routed_model: null,
-          label: null,
-          decision: 'fallback',
-          fallback_reason: String((e && e.message) || e),
-          est_input_tokens: Math.floor(rawBody.length / 4),
-          cache_hit: false,
-        },
-      };
-    }
+      const rawBody = await readBody(req);
+      const pathname = new URL(req.url, 'http://x').pathname;
 
-    let body = rawBody;
-    if (decision.rewrite && decision.routedModel) {
+      // Fast path (a): anything not exactly POST /v1/messages is a transparent,
+      // unlogged passthrough (count_tokens, GETs, etc.).
+      if (req.method !== 'POST' || pathname !== '/v1/messages') {
+        await forward(config, req, rawBody, res);
+        return;
+      }
+
+      let decision;
       try {
-        const obj = JSON.parse(rawBody.toString('utf8'));
-        obj.model = decision.routedModel;
-        body = Buffer.from(JSON.stringify(obj));
+        decision = await decide({
+          rawBody,
+          config,
+          classify: (digest) => classify({ digest, config, incomingHeaders: req.headers }),
+          now: Date.now,
+          cache,
+        });
+      } catch (e) {
+        decision = {
+          routedModel: null,
+          rewrite: false,
+          log: {
+            key: null,
+            original_model: null,
+            routed_model: null,
+            label: null,
+            decision: 'fallback',
+            fallback_reason: String((e && e.message) || e),
+            est_input_tokens: Math.floor(rawBody.length / 4),
+            cache_hit: false,
+          },
+        };
+      }
+
+      let body = rawBody;
+      if (decision.rewrite && decision.routedModel) {
+        try {
+          const obj = JSON.parse(rawBody.toString('utf8'));
+          obj.model = decision.routedModel;
+          body = Buffer.from(JSON.stringify(obj));
+        } catch {
+          body = rawBody; // fail-open: never corrupt the forwarded request
+        }
+      }
+
+      // Await the log write so concurrent requests each land a complete line
+      // before their response completes.
+      try {
+        await logger.write(decision.log);
       } catch {
-        body = rawBody; // fail-open: never corrupt the forwarded request
+        /* logging must never break a request */
+      }
+      fallbackTracker(decision.log.decision);
+
+      await forward(config, req, body, res);
+    } catch (e) {
+      // Covers: aborted upload, client destroying the socket mid-SSE, upstream
+      // fetch failure, and upstream body iterator errors. Never let it escape.
+      console.error('[claude-router] request error:', (e && e.stack) || e);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(errorEnvelope('claude-router: upstream request failed'));
+      } else {
+        res.destroy();
       }
     }
-
-    // Await the log write so concurrent requests each land a complete line
-    // before their response completes.
-    try {
-      await logger.write(decision.log);
-    } catch {
-      /* logging must never break a request */
-    }
-    fallbackTracker(decision.log.decision);
-
-    return forward(config, req, body, res);
   };
 }
 
@@ -195,14 +269,15 @@ async function selfCheck(config) {
 }
 
 async function startServer(opts = {}) {
-  const config = opts.config || loadConfig(opts.configPath);
+  let config = opts.config ? mergeConfig(opts.config) : loadConfig(opts.configPath);
   if (opts.upstream) config.upstream = opts.upstream;
   if (process.env.ROUTER_UPSTREAM) config.upstream = process.env.ROUTER_UPSTREAM;
 
+  validateConfig(config); // fail-closed: exits on bad tiers/upstream
+
   const logFile =
     opts.logFile || process.env.ROUTER_LOG_FILE || path.join(__dirname, 'decisions.jsonl');
-  const port =
-    opts.port != null ? opts.port : process.env.ROUTER_PORT ? Number(process.env.ROUTER_PORT) : config.port;
+  const port = resolvePort(opts, config);
 
   const cache = new Map();
   const logger = createLogger(logFile);
@@ -218,7 +293,7 @@ async function startServer(opts = {}) {
   };
 }
 
-module.exports = { startServer, loadConfig, DEFAULTS };
+module.exports = { startServer, loadConfig, mergeConfig, validateConfig, DEFAULTS };
 
 if (require.main === module) {
   startServer({})

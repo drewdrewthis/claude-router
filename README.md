@@ -63,7 +63,16 @@ whose own credentials also fail.
 | `classifierTimeoutMs` | `3000` | hard timeout on the classifier call (covers cold TLS handshake + OAuth Haiku latency; harmless in session mode since it fires once per session) |
 | `maxHaikuInputTokens` | `150000` | above this (est. bytes/4), the `light` tier is forbidden and upgraded to `standard` |
 | `upstream` | `https://api.anthropic.com` | forward target |
+| `allowedUpstreamHosts` | `[]` | extra hostnames allowed as `upstream` (see below) |
 | `port` | `3456` | listen port |
+
+> **Upstream allowlist (fail-closed).** On startup the router validates
+> `new URL(upstream).hostname` against `api.anthropic.com`, `127.0.0.1`,
+> `localhost`, plus anything in `allowedUpstreamHosts`. A non-allowlisted host
+> **exits the process** — it does not fail open — because a redirected upstream
+> would receive your live Anthropic credentials. A non-default upstream logs a
+> one-line stderr notice. Invalid `tiers` (any of light/standard/heavy missing or
+> empty) and an out-of-range `ROUTER_PORT` are likewise fatal at startup.
 
 > **`mode: "request"` warning.** Per-request classification busts Anthropic's
 > model-scoped prompt cache (every model switch cold-restarts it) and usually

@@ -374,6 +374,111 @@ test('non-/v1/messages path (count_tokens) untouched passthrough, no log, no cla
   await mock.close();
 });
 
+test('mid-SSE client abort does not crash the server; follow-up request succeeds', async () => {
+  const mock = await startMock({
+    label: 'heavy',
+    respond: ({ res }) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message_start\ndata: {}\n\n');
+      let n = 0;
+      let alive = true;
+      res.on('close', () => {
+        alive = false;
+      });
+      const tick = () => {
+        if (!alive) return;
+        if (n >= 5) {
+          try {
+            res.write('event: message_stop\ndata: {}\n\n');
+            res.end();
+          } catch {}
+          return;
+        }
+        try {
+          res.write(`event: content_block_delta\ndata: {"i":${n++}}\n\n`);
+        } catch {}
+        setTimeout(tick, 30);
+      };
+      setTimeout(tick, 30);
+    },
+  });
+  const srv = await startServer({ config: baseConfig(), upstream: mock.url, logFile: tmpLog() });
+
+  // Fire a streaming request and destroy the client socket after the first chunk.
+  await new Promise((resolve) => {
+    const req = http.request(
+      { host: '127.0.0.1', port: srv.port, method: 'POST', path: '/v1/messages', headers: { 'content-type': 'application/json' } },
+      (res) => {
+        res.once('data', () => {
+          req.destroy();
+          resolve();
+        });
+        res.on('error', () => {});
+      }
+    );
+    req.on('error', () => {}); // ECONNRESET after destroy
+    req.end(JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'stream then abort' }] }));
+  });
+
+  await new Promise((r) => setTimeout(r, 50)); // let the server process the abort
+
+  // Server must still be alive: a follow-up request completes normally.
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'follow up after abort' }] }),
+  });
+  assert.strictEqual(r.status, 200);
+  assert.ok(r.body.toString('utf8').includes('message_stop'));
+
+  await srv.close();
+  await mock.close();
+});
+
+test('non-allowlisted upstream host is rejected by validateConfig', async () => {
+  const { validateConfig, mergeConfig } = require('../router');
+  const original = process.exit;
+  let exited = 0;
+  process.exit = () => {
+    exited++;
+    throw new Error('exit'); // stop execution the way process.exit would
+  };
+  try {
+    assert.throws(() =>
+      validateConfig(mergeConfig({ upstream: 'https://evil.example.com', tiers: TIERS }))
+    );
+    assert.strictEqual(exited, 1);
+    // loopback + api.anthropic.com pass
+    exited = 0;
+    validateConfig(mergeConfig({ upstream: 'http://127.0.0.1:9', tiers: TIERS }));
+    assert.strictEqual(exited, 0);
+  } finally {
+    process.exit = original;
+  }
+});
+
+test('partial tiers deep-merge over defaults; missing tier is fatal', async () => {
+  const { mergeConfig, validateConfig } = require('../router');
+  const merged = mergeConfig({ tiers: { heavy: 'my-opus' } });
+  assert.strictEqual(merged.tiers.heavy, 'my-opus');
+  assert.strictEqual(merged.tiers.light, 'claude-haiku-4-5'); // preserved from defaults
+  assert.strictEqual(merged.tiers.standard, 'claude-sonnet-5');
+
+  const original = process.exit;
+  let exited = 0;
+  process.exit = () => {
+    exited++;
+    throw new Error('exit');
+  };
+  try {
+    assert.throws(() =>
+      validateConfig({ upstream: 'http://127.0.0.1:9', tiers: { light: '', standard: 'x', heavy: 'y' } })
+    );
+    assert.ok(exited >= 1);
+  } finally {
+    process.exit = original;
+  }
+});
+
 test('decision log contains no message/prompt text (sentinel absent)', async () => {
   const mock = await startMock({ label: 'heavy' });
   const logFile = tmpLog();
