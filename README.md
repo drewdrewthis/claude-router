@@ -78,18 +78,64 @@ whose own credentials also fail.
 > model-scoped prompt cache (every model switch cold-restarts it) and usually
 > costs **more**, not less. Keep `session` unless you know why you want otherwise.
 
+## Multi-provider routing (offload tiers to other providers)
+
+The real payoff: route cheaper tiers onto a **different provider** — e.g. NVIDIA's
+free OpenAI-compatible endpoints — while the client keeps speaking Anthropic. The
+router translates the request to `chat.completions`, forwards it, and translates
+the response (including streaming SSE) back to Anthropic events.
+
+A **tier value** is either `"provider,model"` or a bare model name (which implies
+the `anthropic` provider — full backward compatibility). Providers are declared
+under `providers`:
+
+```json
+"providers": {
+  "anthropic": { "type": "anthropic" },
+  "nvidia": { "type": "openai", "base_url": "https://integrate.api.nvidia.com/v1", "api_key_env": "NVIDIA_API_KEY" }
+}
+```
+
+### NVIDIA free-tier quickstart
+
+1. Get an NVIDIA API key and export it: `export NVIDIA_API_KEY=nvapi-…`
+2. Point a tier at an NVIDIA model, e.g. in `config.json`:
+   ```json
+   "tiers": {
+     "light": "nvidia,meta/llama-3.3-70b-instruct",
+     "standard": "claude-sonnet-5",
+     "heavy": "claude-opus-4-8"
+   }
+   ```
+3. Run the router. Light requests now go to NVIDIA (free), the rest to Anthropic.
+
+If `NVIDIA_API_KEY` is unset, the router **warns loudly at startup** and any
+request routed to NVIDIA **fails open to an Anthropic passthrough** (logged as
+`fallback` with `fallback_reason: "provider-key-missing:nvidia"`) — it never
+breaks the request.
+
+### Security invariant (client credentials never cross providers)
+
+When forwarding to a non-Anthropic provider, the router sends **only**
+`Authorization: Bearer <env[api_key_env]>`. The client's Anthropic credential
+headers (`authorization`, `x-api-key`, `anthropic-*`) are **never** forwarded to a
+non-Anthropic provider — a redirected upstream must not be able to harvest them.
+Provider `base_url`s are validated at startup as parseable **https** URLs
+(loopback exempt for local dev), fail-closed.
+
 ## Decision log (`decisions.jsonl`, override via `ROUTER_LOG_FILE`)
 
 One JSON object per line. **Never contains prompt text, message content, or
 headers** — only routing metadata:
 
 ```json
-{"ts":"…","key":"<12-char hash>","original_model":"…","routed_model":"…","label":"heavy","decision":"routed","est_input_tokens":1234,"classifier_ms":210,"cache_hit":false}
+{"ts":"…","key":"<12-char hash>","original_model":"…","routed_model":"…","provider":"nvidia","label":"heavy","decision":"routed","est_input_tokens":1234,"classifier_ms":210,"cache_hit":false}
 ```
 
 `decision` is one of: `routed`, `cache-hit`, `already-light`, `pinned`,
 `midflight-passthrough`, `malformed-passthrough`, `fallback` (adds
-`fallback_reason`).
+`fallback_reason`, e.g. `provider-key-missing:<name>`). `provider` names the
+provider the request was routed to (`anthropic` for all passthrough/fallback).
 
 ## Known limitations
 
@@ -100,3 +146,19 @@ headers** — only routing metadata:
 - `mode: "request"` defeats the prompt cache — see the warning above.
 - Token estimate is `bytes/4`, a coarse heuristic used only for the Haiku
   context guard, not for billing.
+
+### Cross-provider translation limitations
+
+- **`thinking` is dropped.** Extended-thinking / reasoning requests are silently
+  stripped when translating to a non-Anthropic provider (no equivalent field).
+- **Prompt caching does not apply cross-provider.** Anthropic's model-scoped cache
+  is meaningless once a tier lands on another provider; session-stickiness still
+  avoids thrashing within a session.
+- **`count_tokens` is Anthropic-only.** `/v1/messages/count_tokens` always
+  passes through to Anthropic; for a session pinned to a non-Anthropic provider it
+  is an approximation, not the provider's own tokenizer.
+- **Tool fidelity on small models.** `tool_use` / `tool_result` are translated to
+  OpenAI `tool_calls` / `role:"tool"` messages, but small open models may emit
+  malformed tool-call JSON; unparseable arguments degrade to `input: {}` (logged
+  to stderr) rather than failing the response.
+- Response `message_start.model` reports the routed `provider/model` string.

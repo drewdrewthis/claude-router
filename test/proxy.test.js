@@ -494,3 +494,151 @@ test('decision log contains no message/prompt text (sentinel absent)', async () 
   await srv.close();
   await mock.close();
 });
+
+// ---------- cross-provider (OpenAI-compatible) routing ----------
+
+// Mock OpenAI-compatible upstream. Records POST /chat/completions requests and
+// replies with either a streaming chat.completions SSE (default) or canned JSON.
+function startOpenaiMock({ stream = true } = {}) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
+      if (stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+        send({ id: 'cmpl-x', choices: [{ delta: { role: 'assistant', content: '' } }] });
+        setTimeout(() => {
+          send({ choices: [{ delta: { content: 'Hello from ' } }] });
+          setTimeout(() => {
+            send({ choices: [{ delta: { content: 'the provider' } }] });
+            send({ choices: [{ delta: {}, finish_reason: 'stop' }] });
+            send({ choices: [], usage: { prompt_tokens: 9, completion_tokens: 3 } });
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }, 60);
+        }, 60);
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            id: 'cmpl-y',
+            choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'non-stream reply' } }],
+            usage: { prompt_tokens: 4, completion_tokens: 2 },
+          })
+        );
+      }
+    });
+  });
+  return new Promise((r) => {
+    server.listen(0, '127.0.0.1', () =>
+      r({
+        url: `http://127.0.0.1:${server.address().port}`,
+        requests,
+        close: () => new Promise((rr) => server.close(rr)),
+      })
+    );
+  });
+}
+
+function providerConfig(openaiUrl, over = {}) {
+  return baseConfig({
+    tiers: { light: 'claude-haiku-4-5', standard: 'claude-sonnet-5', heavy: 'mockai,demo-model' },
+    providers: {
+      anthropic: { type: 'anthropic' },
+      mockai: { type: 'openai', base_url: openaiUrl, api_key_env: 'MOCKAI_KEY' },
+    },
+    ...over,
+  });
+}
+
+test('openai provider: SSE round-trip yields a valid Anthropic event stream; client creds never cross', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' }); // classifier + (unused) anthropic upstream
+  const oai = await startOpenaiMock({ stream: true });
+  const srv = await startServer({ config: providerConfig(oai.url), upstream: anth.url, logFile: tmpLog() });
+
+  const clientAuth = 'Bearer sk-ant-CLIENT-TOKEN';
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json', authorization: clientAuth, 'anthropic-beta': 'oauth-2025-04-20', 'x-api-key': 'client-xkey' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', stream: true, messages: [{ role: 'user', content: 'route me cross-provider' }] }),
+  });
+
+  // Client receives a well-formed Anthropic SSE.
+  const text = r.body.toString('utf8');
+  const events = [...text.matchAll(/event: (\w+)/g)].map((m) => m[1]);
+  assert.strictEqual(events[0], 'message_start');
+  assert.strictEqual(events[events.length - 1], 'message_stop');
+  assert.ok(events.includes('content_block_delta'));
+  const startData = JSON.parse(text.match(/event: message_start\ndata: (.*)/)[1]);
+  assert.strictEqual(startData.message.model, 'mockai/demo-model');
+
+  // SECURITY: the OpenAI upstream saw ONLY the provider bearer, never client creds.
+  assert.strictEqual(oai.requests.length, 1);
+  const h = oai.requests[0].headers;
+  assert.strictEqual(h['authorization'], 'Bearer provider-secret-key');
+  assert.notStrictEqual(h['authorization'], clientAuth);
+  assert.strictEqual(h['x-api-key'], undefined);
+  assert.strictEqual(h['anthropic-beta'], undefined);
+  assert.strictEqual(oai.requests[0].url, '/chat/completions');
+
+  await srv.close();
+  await anth.close();
+  await oai.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('openai provider: missing credential env fails open to Anthropic passthrough with fallback_reason', async () => {
+  delete process.env.MOCKAI_KEY; // key intentionally absent
+  const anth = await startMock({ label: 'heavy' });
+  const oai = await startOpenaiMock({ stream: true });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: providerConfig(oai.url), upstream: anth.url, logFile });
+
+  await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'route but key missing' }] }),
+  });
+
+  // Fell open to Anthropic: original model reached the anthropic mock; openai mock untouched.
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1);
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet');
+  assert.strictEqual(oai.requests.length, 0);
+
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const entry = lines[lines.length - 1];
+  assert.strictEqual(entry.decision, 'fallback');
+  assert.strictEqual(entry.fallback_reason, 'provider-key-missing:mockai');
+
+  await srv.close();
+  await anth.close();
+  await oai.close();
+});
+
+test('openai provider: non-stream response is translated into an Anthropic message envelope', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  const oai = await startOpenaiMock({ stream: false });
+  const srv = await startServer({ config: providerConfig(oai.url), upstream: anth.url, logFile: tmpLog() });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'non stream please' }] }),
+  });
+  assert.strictEqual(r.status, 200);
+  const env = JSON.parse(r.body.toString('utf8'));
+  assert.strictEqual(env.type, 'message');
+  assert.strictEqual(env.role, 'assistant');
+  assert.strictEqual(env.model, 'mockai/demo-model');
+  assert.deepStrictEqual(env.content, [{ type: 'text', text: 'non-stream reply' }]);
+  assert.strictEqual(env.stop_reason, 'end_turn');
+  assert.deepStrictEqual(env.usage, { input_tokens: 4, output_tokens: 2 });
+
+  await srv.close();
+  await anth.close();
+  await oai.close();
+  delete process.env.MOCKAI_KEY;
+});

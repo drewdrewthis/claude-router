@@ -185,6 +185,36 @@ test('unexpected label -> fallback', async () => {
   assert.strictEqual(d.log.decision, 'fallback');
 });
 
+test('provider-prefixed tier resolves to {provider, model}; bare stays anthropic', async () => {
+  const cfg = baseConfig({
+    tiers: {
+      light: 'claude-haiku-4-5',
+      standard: 'claude-sonnet-5',
+      heavy: 'nvidia,meta/llama-3.3-70b-instruct',
+    },
+  });
+  const heavy = await decide({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'complex' }] }),
+    config: cfg,
+    classify: async () => 'heavy',
+    now: fixedClock(),
+    cache: new Map(),
+  });
+  assert.deepStrictEqual(heavy.routed, { provider: 'nvidia', model: 'meta/llama-3.3-70b-instruct' });
+  assert.strictEqual(heavy.routedModel, 'meta/llama-3.3-70b-instruct');
+  assert.strictEqual(heavy.log.provider, 'nvidia');
+
+  const light = await decide({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'trivial' }] }),
+    config: cfg,
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+  });
+  assert.deepStrictEqual(light.routed, { provider: 'anthropic', model: 'claude-haiku-4-5' });
+  assert.strictEqual(light.log.provider, 'anthropic');
+});
+
 test('request mode classifies every request (no cache)', async () => {
   let calls = 0;
   const cache = new Map();

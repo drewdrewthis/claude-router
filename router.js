@@ -16,6 +16,11 @@ const { pipeline } = require('node:stream/promises');
 const { decide } = require('./lib/decide');
 const { classify } = require('./lib/classify');
 const { createLogger } = require('./lib/log');
+const {
+  requestAnthropicToOpenai,
+  responseOpenaiToAnthropic,
+  streamOpenaiToAnthropic,
+} = require('./lib/translate');
 
 const DEFAULTS = {
   mode: 'session',
@@ -26,6 +31,14 @@ const DEFAULTS = {
   maxHaikuInputTokens: 150000,
   upstream: 'https://api.anthropic.com',
   port: 3456,
+  providers: {
+    anthropic: { type: 'anthropic' },
+    nvidia: {
+      type: 'openai',
+      base_url: 'https://integrate.api.nvidia.com/v1',
+      api_key_env: 'NVIDIA_API_KEY',
+    },
+  },
 };
 
 // Upstream hosts we will ever send live credentials to. Anything else is a
@@ -58,7 +71,12 @@ function fatal(msg) {
 // who overrides only one tier keeps the other two.
 function mergeConfig(base) {
   base = base || {};
-  return { ...DEFAULTS, ...base, tiers: { ...DEFAULTS.tiers, ...(base.tiers || {}) } };
+  return {
+    ...DEFAULTS,
+    ...base,
+    tiers: { ...DEFAULTS.tiers, ...(base.tiers || {}) },
+    providers: { ...DEFAULTS.providers, ...(base.providers || {}) },
+  };
 }
 
 function loadConfig(configPath) {
@@ -95,6 +113,46 @@ function validateConfig(config) {
   }
   if (host !== 'api.anthropic.com') {
     console.error(`[claude-router] NOTICE: forwarding to non-default upstream ${config.upstream}`);
+  }
+
+  // Provider base_urls are operator-configured (implicitly allowlisted) but must
+  // still be a parseable URL and https (loopback exempt so local dev/tests work).
+  for (const [name, p] of Object.entries(config.providers || {})) {
+    if (!p || typeof p !== 'object') fatal(`provider "${name}" must be an object.`);
+    if (p.type === 'openai') {
+      let u;
+      try {
+        u = new URL(p.base_url);
+      } catch {
+        fatal(`provider "${name}": base_url ${JSON.stringify(p.base_url)} is not a valid URL.`);
+      }
+      const loopback = u.hostname === '127.0.0.1' || u.hostname === 'localhost';
+      if (u.protocol !== 'https:' && !loopback) {
+        fatal(`provider "${name}": base_url must be https (got ${u.protocol}//${u.hostname}).`);
+      }
+    }
+  }
+}
+
+// Warn loudly for any provider referenced in tiers whose credential env is unset.
+// (Requests to it will fail open to Anthropic — see the handler.)
+function warnMissingProviderKeys(config) {
+  const referenced = new Set();
+  for (const v of Object.values(config.tiers || {})) {
+    if (typeof v === 'string' && v.includes(',')) referenced.add(v.slice(0, v.indexOf(',')).trim());
+  }
+  for (const name of referenced) {
+    const p = (config.providers || {})[name];
+    if (!p) {
+      console.error(`[claude-router] WARNING: tier references unknown provider "${name}".`);
+      continue;
+    }
+    if (p.type === 'openai' && p.api_key_env && !process.env[p.api_key_env]) {
+      console.error(
+        `[claude-router] WARNING: provider "${name}" credential env ${p.api_key_env} is unset — ` +
+          `requests routed to it will FAIL OPEN to Anthropic.`
+      );
+    }
   }
 }
 
@@ -134,6 +192,80 @@ async function forward(config, req, body, res) {
   else res.end();
 }
 
+// Translate the Anthropic request onto an OpenAI-compatible provider and forward.
+// SECURITY INVARIANT: the client's Anthropic credential headers are NEVER sent
+// here — we send ONLY `Authorization: Bearer <provider env key>`.
+async function forwardOpenai(plan, rawBody, res) {
+  const { provider, apiKey, model, name } = plan;
+  const reportModel = `${name}/${model}`;
+
+  let anthropicBody;
+  try {
+    anthropicBody = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    anthropicBody = {};
+  }
+  const stream = anthropicBody.stream === true;
+  const openaiReq = requestAnthropicToOpenai(anthropicBody, model);
+
+  const provRes = await fetch(provider.base_url.replace(/\/$/, '') + '/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(openaiReq),
+  });
+
+  if (!provRes.ok) {
+    const detail = await provRes.text().catch(() => '');
+    console.error(`[claude-router] provider "${name}" error ${provRes.status}: ${detail.slice(0, 200)}`);
+    if (!res.headersSent) res.writeHead(provRes.status, { 'content-type': 'application/json' });
+    res.end(errorEnvelope(`claude-router: provider ${name} error`));
+    return;
+  }
+
+  if (stream) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    const rawChunks = provRes.body ? Readable.fromWeb(provRes.body) : [];
+    for await (const ev of streamOpenaiToAnthropic(rawChunks, reportModel)) res.write(ev);
+    res.end();
+  } else {
+    const json = await provRes.json();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(responseOpenaiToAnthropic(json, reportModel)));
+  }
+}
+
+// Resolve a routed decision into a concrete forwarding plan. Non-anthropic
+// providers whose credential env is missing (or that are unknown/misconfigured)
+// fail OPEN: the decision is rewritten to an Anthropic passthrough fallback and
+// the log entry records the reason. Mutates decision.log in place.
+function planForward(config, decision) {
+  const routed = decision.routed;
+  if (!routed || routed.provider === 'anthropic') return null; // handled by Anthropic path
+
+  const provider = (config.providers || {})[routed.provider];
+  const apiKey = provider && provider.api_key_env ? process.env[provider.api_key_env] : null;
+
+  if (!provider || provider.type !== 'openai') {
+    failOpen(decision, `provider-unknown:${routed.provider}`);
+    return null;
+  }
+  if (!apiKey) {
+    failOpen(decision, `provider-key-missing:${routed.provider}`);
+    return null;
+  }
+  return { provider, apiKey, model: routed.model, name: routed.provider };
+}
+
+function failOpen(decision, reason) {
+  decision.routed = null;
+  decision.routedModel = null;
+  decision.rewrite = false;
+  decision.log.decision = 'fallback';
+  decision.log.fallback_reason = reason;
+  decision.log.provider = 'anthropic';
+  decision.log.routed_model = decision.log.original_model;
+}
+
 function makeHandler(config, cache, logger, fallbackTracker) {
   return async function handler(req, res) {
     // Swallow client-side disconnects (ECONNRESET/EPIPE) so an aborted socket
@@ -163,12 +295,14 @@ function makeHandler(config, cache, logger, fallbackTracker) {
         });
       } catch (e) {
         decision = {
+          routed: null,
           routedModel: null,
           rewrite: false,
           log: {
             key: null,
             original_model: null,
             routed_model: null,
+            provider: 'anthropic',
             label: null,
             decision: 'fallback',
             fallback_reason: String((e && e.message) || e),
@@ -178,8 +312,11 @@ function makeHandler(config, cache, logger, fallbackTracker) {
         };
       }
 
+      // Non-anthropic routes resolve to a forwarding plan (or fail open here).
+      const openaiPlan = planForward(config, decision);
+
       let body = rawBody;
-      if (decision.rewrite && decision.routedModel) {
+      if (!openaiPlan && decision.rewrite && decision.routedModel) {
         try {
           const obj = JSON.parse(rawBody.toString('utf8'));
           obj.model = decision.routedModel;
@@ -198,7 +335,8 @@ function makeHandler(config, cache, logger, fallbackTracker) {
       }
       fallbackTracker(decision.log.decision);
 
-      await forward(config, req, body, res);
+      if (openaiPlan) await forwardOpenai(openaiPlan, rawBody, res);
+      else await forward(config, req, body, res);
     } catch (e) {
       // Covers: aborted upload, client destroying the socket mid-SSE, upstream
       // fetch failure, and upstream body iterator errors. Never let it escape.
@@ -273,7 +411,8 @@ async function startServer(opts = {}) {
   if (opts.upstream) config.upstream = opts.upstream;
   if (process.env.ROUTER_UPSTREAM) config.upstream = process.env.ROUTER_UPSTREAM;
 
-  validateConfig(config); // fail-closed: exits on bad tiers/upstream
+  validateConfig(config); // fail-closed: exits on bad tiers/upstream/providers
+  warnMissingProviderKeys(config);
 
   const logFile =
     opts.logFile || process.env.ROUTER_LOG_FILE || path.join(__dirname, 'decisions.jsonl');
@@ -293,7 +432,14 @@ async function startServer(opts = {}) {
   };
 }
 
-module.exports = { startServer, loadConfig, mergeConfig, validateConfig, DEFAULTS };
+module.exports = {
+  startServer,
+  loadConfig,
+  mergeConfig,
+  validateConfig,
+  warnMissingProviderKeys,
+  DEFAULTS,
+};
 
 if (require.main === module) {
   startServer({})
