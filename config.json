@@ -1,0 +1,10 @@
+{
+  "mode": "session",
+  "tiers": { "light": "claude-haiku-4-5", "standard": "claude-sonnet-5", "heavy": "claude-opus-4-8" },
+  "pinned": [],
+  "classifierModel": "claude-haiku-4-5",
+  "classifierTimeoutMs": 3000,
+  "maxHaikuInputTokens": 150000,
+  "upstream": "https://api.anthropic.com",
+  "port": 3456
+}
