@@ -1,0 +1,19 @@
+=== claude-router LIVE NVIDIA wire proof (real API, real translate.js) ===
+captured 2026-07-07T16:46:35.486Z  model meta/llama-3.1-70b-instruct  endpoint https://integrate.api.nvidia.com/v1/chat/completions
+translate.js exports: requestAnthropicToOpenai, responseOpenaiToAnthropic, streamOpenaiToAnthropic, singleShotSSE, toolResultToText, mapFinish, mapToolChoice, genId
+
+[TEXT-1] requestAnthropicToOpenai -> {"model":"meta/llama-3.1-70b-instruct","messages":[{"role":"user","content":"Reply with exactly the single word: PONG"}]}
+[TEXT-2] NVIDIA http 200
+[TEXT-3] NVIDIA raw content: "PONG"
+[TEXT-4] responseOpenaiToAnthropic -> {"id":"chatcmpl-9ac15da626b4d97f","type":"message","role":"assistant","model":"meta/llama-3.1-70b-instruct","content":[{"type":"text","text":"PONG"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":44,"output_tokens":3}}
+[TEXT-5] NVIDIA stream http 200
+[TEXT-6] streamOpenaiToAnthropic -> 7 events; message_start=true delta=true message_stop=true
+        text deltas: ["\"text\":\"\"","\"text\":\"P\"","\"text\":\"ONG\""]
+
+[TOOL-1] requestAnthropicToOpenai -> tools=[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}] tool_choice={"type":"function","function":{"name":"get_weather"}}
+[TOOL-2] NVIDIA http 200
+[TOOL-3] NVIDIA raw tool_calls: [{"id":"chatcmpl-tool-8373a3ac4a570a8e","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}]
+[TOOL-4] responseOpenaiToAnthropic -> {"id":"chatcmpl-bc770aead3a1ad25","type":"message","role":"assistant","model":"meta/llama-3.1-70b-instruct","content":[{"type":"tool_use","id":"chatcmpl-tool-8373a3ac4a570a8e","name":"get_weather","input":{"city":"Paris"}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":248,"output_tokens":7}}
+[TOOL-5] NVIDIA stream http 200
+[TOOL-6] streamOpenaiToAnthropic -> 11 events; tool_use block=true input_json_delta=true message_stop=true
+        input_json deltas: ["\"partial_json\":\"{\\\"","\"partial_json\":\"city\"","\"partial_json\":\"\\\"","\"partial_json\":\" \\\"","\"partial_json\":\"Paris\"","\"partial_json\":\"\\\""]
