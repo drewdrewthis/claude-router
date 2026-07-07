@@ -288,10 +288,10 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
   }
 }
 
-// Resolve a routed decision into a concrete forwarding plan. Non-anthropic
-// providers whose credential env is missing (or that are unknown/misconfigured)
-// fail OPEN: the decision is rewritten to an Anthropic passthrough fallback and
-// the log entry records the reason. Mutates decision.log in place.
+// Resolve a routed decision into a concrete forwarding plan. Routes fail OPEN (rewritten
+// to an Anthropic passthrough fallback, the reason recorded in the log) when the provider
+// is unknown/misconfigured, its credential env is missing, OR the request carries non-text
+// content a text-only provider cannot consume (the modality gate). Mutates decision.log.
 function planForward(config, decision) {
   const routed = decision.routed;
   if (!routed || routed.provider === 'anthropic') return null; // handled by Anthropic path
@@ -301,6 +301,17 @@ function planForward(config, decision) {
 
   if (!provider || provider.type !== 'openai') {
     failOpen(decision, `provider-unknown:${routed.provider}`);
+    return null;
+  }
+  // MODALITY GATE: a non-text request (image/document/audio, or a tool_result embedding
+  // one) must never reach a text-only model — translate.js faithfully emits an OpenAI
+  // image_url block the model cannot use, so the provider 400s or silently answers blind.
+  // Checked before the credential check: routing a non-text turn to a text model is wrong
+  // even with a valid key. FIRST CUT: no openai provider is vision-capable (there is no
+  // per-provider vision flag yet), so ANY non-text content forces the Anthropic path. A
+  // follow-up adds a per-provider/-model vision-capability check to permit vision routes.
+  if (decision.hasNonText) {
+    failOpen(decision, 'modality:non-text-to-text-model');
     return null;
   }
   if (!apiKey) {

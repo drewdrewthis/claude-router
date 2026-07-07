@@ -643,6 +643,68 @@ test('openai provider: non-stream response is translated into an Anthropic messa
   delete process.env.MOCKAI_KEY;
 });
 
+test('modality gate: an image request routed to a text-only openai provider fails open to Anthropic', async () => {
+  // Key PRESENT on purpose: proves the MODALITY gate diverts, not a missing credential.
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'standard' }); // classifier + Anthropic fallback upstream
+  const prov = await startProviderMock(({ res }) => {
+    // Must never be reached. If it is, answer so the test fails on the routing assert (not a hang).
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id: 'cmpl-should-not-happen',
+        choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'blind' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      })
+    );
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({
+    config: providerConfig(prov.url, {
+      tiers: { light: 'claude-haiku-4-5', standard: 'mockai,demo-model', heavy: 'claude-opus-4-8' },
+    }),
+    upstream: anth.url,
+    logFile,
+  });
+
+  await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+            { type: 'text', text: 'what is this?' },
+          ],
+        },
+      ],
+    }),
+  });
+
+  // Served by ANTHROPIC (fail-open), NOT the text-only provider.
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1, 'the image request must be served by the Anthropic upstream');
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet'); // ORIGINAL model
+  assert.strictEqual(prov.requests.length, 0, 'the text-only provider must never receive a non-text request');
+
+  // Decision log records an Anthropic modality fallback.
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.strictEqual(last.provider, 'anthropic');
+  assert.ok(
+    typeof last.fallback_reason === 'string' && last.fallback_reason.startsWith('modality:'),
+    `fallback_reason should start with 'modality:', got ${JSON.stringify(last.fallback_reason)}`
+  );
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
 // ---------- hardening: provider timeout + runtime fail-open + non-SSE re-envelope ----------
 
 // Fully controllable OpenAI-compatible provider mock: the handler decides status,

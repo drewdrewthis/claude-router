@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { decide } = require('../lib/decide');
+const { decide, hasNonTextContent, buildDigest } = require('../lib/decide');
 
 const TIERS = { light: 'claude-haiku-4-5', standard: 'claude-sonnet-5', heavy: 'claude-opus-4-8' };
 
@@ -232,4 +232,86 @@ test('request mode classifies every request (no cache)', async () => {
   await decide(req());
   assert.strictEqual(calls, 2);
   assert.strictEqual(cache.size, 0);
+});
+
+// ---------- modality: non-text content detection + modality-aware digest ----------
+
+test('hasNonTextContent: true for an image body, false for text-only / tool_use / string / malformed', () => {
+  const imageBody = {
+    model: 'claude-sonnet-4',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+          { type: 'text', text: 'what is this?' },
+        ],
+      },
+    ],
+  };
+  assert.strictEqual(hasNonTextContent(imageBody), true);
+
+  // pure text (array + string forms) and tool_use are text -> false
+  assert.strictEqual(
+    hasNonTextContent({ messages: [{ role: 'user', content: [{ type: 'text', text: 'plain' }] }] }),
+    false
+  );
+  assert.strictEqual(hasNonTextContent({ messages: [{ role: 'user', content: 'hi' }] }), false);
+  assert.strictEqual(
+    hasNonTextContent({
+      messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'f', input: {} }] }],
+    }),
+    false
+  );
+
+  // a tool_result embedding a non-text block is non-text; a text-only tool_result is not
+  assert.strictEqual(
+    hasNonTextContent({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu1',
+              content: [
+                { type: 'text', text: 'see image:' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+              ],
+            },
+          ],
+        },
+      ],
+    }),
+    true
+  );
+  assert.strictEqual(
+    hasNonTextContent({
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: '42' }] }],
+    }),
+    false
+  );
+
+  // malformed bodies never throw
+  assert.strictEqual(hasNonTextContent({}), false);
+  assert.strictEqual(hasNonTextContent(null), false);
+  assert.strictEqual(hasNonTextContent({ messages: 'nope' }), false);
+});
+
+test('buildDigest: meta line carries an image count (images=1 with an image, images=0 without)', () => {
+  const imageBody = {
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+          { type: 'text', text: 'what is this?' },
+        ],
+      },
+    ],
+  };
+  assert.match(buildDigest(imageBody, 42), /\[meta est_tokens=42 tools=0 thinking=false images=1\]/);
+
+  const textBody = { messages: [{ role: 'user', content: 'just text' }] };
+  assert.match(buildDigest(textBody, 7), /\[meta est_tokens=7 tools=0 thinking=false images=0\]/);
 });
