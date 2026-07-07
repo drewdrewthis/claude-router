@@ -62,6 +62,7 @@ whose own credentials also fail.
 | `classifierModel` | `claude-haiku-4-5` | model used for the classifier call |
 | `classifierTimeoutMs` | `3000` | hard timeout on the classifier call (covers cold TLS handshake + OAuth Haiku latency; harmless in session mode since it fires once per session) |
 | `maxHaikuInputTokens` | `150000` | above this (est. bytes/4), the `light` tier is forbidden and upgraded to `standard` |
+| `providerTimeoutMs` | `30000` | hard timeout on the OpenAI-compatible provider fetch. For a **streaming** request it bounds only time-to-response-headers, so a long streaming body is never clipped. For a **non-stream** request it *also* bounds the response-body read, so a provider that sends headers then stalls its body still **fails open to Anthropic**. On timeout or provider error (before any client bytes stream) the request fails open |
 | `upstream` | `https://api.anthropic.com` | forward target |
 | `allowedUpstreamHosts` | `[]` | extra hostnames allowed as `upstream` (see below) |
 | `port` | `3456` | listen port |
@@ -149,8 +150,16 @@ provider the request was routed to (`anthropic` for all passthrough/fallback).
 
 ### Cross-provider translation limitations
 
-- **`thinking` is dropped.** Extended-thinking / reasoning requests are silently
-  stripped when translating to a non-Anthropic provider (no equivalent field).
+- **`thinking` blocks are dropped when routing to a non-Anthropic provider.** Those
+  models have no Anthropic-style thinking, so neither the request-level `thinking`
+  parameter nor any `thinking` blocks in assistant history are forwarded (they are
+  simply not copied during translation). Replay is unaffected: OpenAI reconstructs
+  conversational context from the surrounding text and `tool_calls`, not from a
+  thinking transcript.
+- **Tool names pass through unchanged.** A provider that enforces OpenAI's 64-char
+  function-name limit (`^[a-zA-Z0-9_-]{1,64}$`) may reject long MCP tool names such as
+  `mcp__server__some_long_tool`. The fix — a truncate-on-request / restore-on-response
+  name map — is deferred until a provider is confirmed to actually enforce the limit.
 - **Prompt caching does not apply cross-provider.** Anthropic's model-scoped cache
   is meaningless once a tier lands on another provider; session-stickiness still
   avoids thrashing within a session.
@@ -162,3 +171,23 @@ provider the request was routed to (`anthropic` for all passthrough/fallback).
   malformed tool-call JSON; unparseable arguments degrade to `input: {}` (logged
   to stderr) rather than failing the response.
 - Response `message_start.model` reports the routed `provider/model` string.
+- **Runtime fail-open to Anthropic.** If a provider fetch throws, times out
+  (`providerTimeoutMs` — which bounds time-to-response-headers for a streaming request
+  and also the response-body read for a non-stream request, so long streams are never
+  clipped yet a stalled non-stream body still aborts), or returns a non-2xx **before
+  any response bytes are streamed**, the request is transparently re-served through
+  Anthropic with the original body/model. A second decision-log line records it
+  (`decision:"fallback"` with `fallback_reason:"provider-http-<status>"`,
+  `"provider-fetch:<name>"`, or `"provider-body:<name>"`, `provider:"anthropic"`). Once
+  streaming has begun there is nothing to fall back to — the stream is cleanly
+  terminated instead.
+- **Non-text `tool_result` content is placeholdered, not dropped.** Image/other
+  non-text blocks inside a `tool_result` have no OpenAI tool-message equivalent, so
+  they are replaced by the literal `[non-text tool result omitted]` (text blocks in
+  the same result are preserved).
+- **`tool_choice: "none"` is honored.** Anthropic `none` (the string or
+  `{ "type": "none" }`) maps to OpenAI `tool_choice: "none"`.
+- **Non-SSE provider stream responses are re-enveloped.** If a provider ignores
+  `stream:true` and returns a single JSON body, it is buffered and re-emitted as a
+  single-shot Anthropic event stream, so a streaming client still receives a valid,
+  non-empty stream (an unparseable body yields a valid, empty terminated stream).

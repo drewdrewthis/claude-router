@@ -642,3 +642,213 @@ test('openai provider: non-stream response is translated into an Anthropic messa
   await oai.close();
   delete process.env.MOCKAI_KEY;
 });
+
+// ---------- hardening: provider timeout + runtime fail-open + non-SSE re-envelope ----------
+
+// Fully controllable OpenAI-compatible provider mock: the handler decides status,
+// delay, content-type, or a mid-stream socket cutoff. Records every request seen.
+function startProviderMock(handler) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('error', () => {});
+    res.on('error', () => {});
+    req.on('end', () => {
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
+      try {
+        handler({ req, res });
+      } catch {
+        try { res.destroy(); } catch {}
+      }
+    });
+  });
+  return new Promise((r) => {
+    server.listen(0, '127.0.0.1', () =>
+      r({
+        url: `http://127.0.0.1:${server.address().port}`,
+        requests,
+        close: () => new Promise((rr) => server.close(rr)),
+      })
+    );
+  });
+}
+
+test('provider HTTP 500 fails open to Anthropic at runtime; provider-http-500 logged', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' }); // classifier + fallback upstream
+  const prov = await startProviderMock(({ res }) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'kaboom' } }));
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'route then 500' }] }),
+  });
+
+  // Client received the Anthropic fallback response, not a provider error.
+  assert.strictEqual(r.status, 200);
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1);
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet'); // ORIGINAL model
+  assert.strictEqual(prov.requests.length, 1); // provider attempted exactly once
+
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.strictEqual(last.fallback_reason, 'provider-http-500');
+  assert.strictEqual(last.provider, 'anthropic');
+  assert.strictEqual(last.routed_model, last.original_model);
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('provider timeout (no response before providerTimeoutMs) fails open to Anthropic', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  const prov = await startProviderMock(({ res }) => {
+    // Never respond within the timeout window; unref so the timer can't hold the loop.
+    const t = setTimeout(() => {
+      try { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); } catch {}
+    }, 4000);
+    if (t.unref) t.unref();
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: providerConfig(prov.url, { providerTimeoutMs: 150 }), upstream: anth.url, logFile });
+
+  const t0 = Date.now();
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'slow provider' }] }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 200);
+  assert.ok(elapsed < 1500, `abort+fallback should be fast, took ${elapsed}ms`);
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1);
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet');
+
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.match(last.fallback_reason, /provider-fetch|abort/);
+  assert.strictEqual(last.provider, 'anthropic');
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('stream requested but provider returns non-SSE JSON is re-enveloped as a single-shot Anthropic stream', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  const prov = await startProviderMock(({ res }) => {
+    // Provider ignored stream:true and answered with a single JSON body.
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id: 'cmpl-ns',
+        choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'single shot text' } }],
+        usage: { prompt_tokens: 5, completion_tokens: 3 },
+      })
+    );
+  });
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile: tmpLog() });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', stream: true, messages: [{ role: 'user', content: 'stream me' }] }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  assert.match(r.headers['content-type'], /text\/event-stream/);
+  const text = r.body.toString('utf8');
+  const events = [...text.matchAll(/event: (\w+)/g)].map((m) => m[1]);
+  assert.strictEqual(events[0], 'message_start');
+  assert.strictEqual(events[events.length - 1], 'message_stop');
+  assert.ok(text.includes('"text_delta"'), 'must contain a text_delta');
+  assert.ok(text.includes('single shot text'), 'must carry the provider text');
+  assert.strictEqual(prov.requests.length, 1);
+  assert.strictEqual(anth.forwarded().length, 0); // provider succeeded: no fallback
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('provider SSE that dies mid-stream still terminates the client stream and does not double-serve', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  const prov = await startProviderMock(({ res }) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ id: 'x', choices: [{ delta: { role: 'assistant', content: 'partial ' } }] })}\n\n`);
+    setTimeout(() => { try { res.destroy(); } catch {} }, 50); // kill the socket mid-stream
+  });
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile: tmpLog() });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', stream: true, messages: [{ role: 'user', content: 'stream then die' }] }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  const text = r.body.toString('utf8');
+  assert.ok(text.includes('message_stop'), 'stream must be cleanly terminated');
+  const stops = [...text.matchAll(/event: message_stop/g)].length;
+  assert.strictEqual(stops, 1, 'exactly one termination, not double-served');
+  assert.strictEqual(anth.forwarded().length, 0); // no fallback once streaming began
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('non-stream provider that sends headers then stalls the body fails open to Anthropic within providerTimeoutMs', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' }); // classifier + fallback upstream
+  const prov = await startProviderMock(({ res }) => {
+    // 200 + headers arrive (so fetch resolves), then a partial body that never
+    // completes. The non-stream branch must stay bounded through the body read so
+    // this still fails open — no client bytes have been written yet.
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"id":"cmpl-stall",'); // never res.end() — body hangs forever
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: providerConfig(prov.url, { providerTimeoutMs: 150 }), upstream: anth.url, logFile });
+
+  const t0 = Date.now();
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' }, // NOT stream:true -> non-stream path
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [{ role: 'user', content: 'stalled body' }] }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 200);
+  assert.ok(elapsed < 1500, `stalled-body fail-open should be fast, took ${elapsed}ms`);
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1);
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet'); // ORIGINAL model, failed open
+  assert.strictEqual(prov.requests.length, 1); // provider attempted exactly once
+
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.strictEqual(last.provider, 'anthropic');
+  assert.strictEqual(last.routed_model, last.original_model);
+  assert.match(last.fallback_reason, /provider-body|abort|provider-fetch/);
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});

@@ -5,6 +5,7 @@
   "classifierModel": "claude-haiku-4-5",
   "classifierTimeoutMs": 3000,
   "maxHaikuInputTokens": 150000,
+  "providerTimeoutMs": 30000,
   "upstream": "https://api.anthropic.com",
   "port": 3456,
   "providers": {

@@ -20,6 +20,7 @@ const {
   requestAnthropicToOpenai,
   responseOpenaiToAnthropic,
   streamOpenaiToAnthropic,
+  singleShotSSE,
 } = require('./lib/translate');
 
 const DEFAULTS = {
@@ -29,6 +30,7 @@ const DEFAULTS = {
   classifierModel: 'claude-haiku-4-5',
   classifierTimeoutMs: 3000,
   maxHaikuInputTokens: 150000,
+  providerTimeoutMs: 30000,
   upstream: 'https://api.anthropic.com',
   port: 3456,
   providers: {
@@ -195,7 +197,13 @@ async function forward(config, req, body, res) {
 // Translate the Anthropic request onto an OpenAI-compatible provider and forward.
 // SECURITY INVARIANT: the client's Anthropic credential headers are NEVER sent
 // here — we send ONLY `Authorization: Bearer <provider env key>`.
-async function forwardOpenai(plan, rawBody, res) {
+//
+// Returns a small result descriptor so the handler owns fail-open orchestration
+// (this keeps forwardOpenai free of logger/config):
+//   { fallback: '<reason>' }  failed BEFORE writing any bytes (fetch threw/aborted
+//                             or !provRes.ok) — the handler serves via Anthropic.
+//   { ok: true }              committed to responding (headers written) — no fallback.
+async function forwardOpenai(plan, rawBody, res, timeoutMs) {
   const { provider, apiKey, model, name } = plan;
   const reportModel = `${name}/${model}`;
 
@@ -208,29 +216,75 @@ async function forwardOpenai(plan, rawBody, res) {
   const stream = anthropicBody.stream === true;
   const openaiReq = requestAnthropicToOpenai(anthropicBody, model);
 
-  const provRes = await fetch(provider.base_url.replace(/\/$/, '') + '/chat/completions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(openaiReq),
-  });
+  // Bound the provider request with an AbortController on `timeoutMs`. Once headers
+  // arrive we branch on stream vs non-stream:
+  //   STREAM: clear the timer immediately so a legitimately long streaming body is
+  //           never aborted mid-flight (providers send headers before generating).
+  //   NON-STREAM: keep the timer ARMED through the body read (`provRes.json()`) below,
+  //           so a provider that sends 200 + headers then stalls its body still fails
+  //           open within `timeoutMs` instead of hanging the client (no client bytes
+  //           written yet). A pre-bytes failure returns a fallback descriptor.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  let provRes;
+  try {
+    provRes = await fetch(provider.base_url.replace(/\/$/, '') + '/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(openaiReq),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    console.error(`[claude-router] provider "${name}" fetch failed: ${String((e && e.message) || e).slice(0, 200)}`);
+    return { fallback: `provider-fetch:${name}` };
+  }
+  if (stream) clearTimeout(timer); // stream: unbind before the (long) body streams
 
   if (!provRes.ok) {
+    // Non-stream keeps the timer armed, so this error-body read is bounded too.
     const detail = await provRes.text().catch(() => '');
+    if (!stream) clearTimeout(timer);
     console.error(`[claude-router] provider "${name}" error ${provRes.status}: ${detail.slice(0, 200)}`);
-    if (!res.headersSent) res.writeHead(provRes.status, { 'content-type': 'application/json' });
-    res.end(errorEnvelope(`claude-router: provider ${name} error`));
-    return;
+    return { fallback: `provider-http-${provRes.status}` };
   }
 
   if (stream) {
+    // The client asked for streaming, so we always answer with SSE.
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    const ctype = provRes.headers.get('content-type') || '';
+    if (!ctype.includes('text/event-stream')) {
+      // Provider ignored stream:true and returned a single JSON body: buffer it and
+      // re-envelope as a one-shot Anthropic stream (never an empty/hung stream).
+      let json = null;
+      try {
+        json = await provRes.json();
+      } catch {
+        json = null;
+      }
+      for (const ev of singleShotSSE(json, reportModel)) res.write(ev);
+      res.end();
+      return { ok: true };
+    }
     const rawChunks = provRes.body ? Readable.fromWeb(provRes.body) : [];
     for await (const ev of streamOpenaiToAnthropic(rawChunks, reportModel)) res.write(ev);
     res.end();
+    return { ok: true };
   } else {
-    const json = await provRes.json();
+    // Non-stream: the timer is still armed, so a stalled body aborts `.json()` and we
+    // fail open (no client bytes written yet). Clear it once the body resolves.
+    let json;
+    try {
+      json = await provRes.json();
+    } catch (e) {
+      clearTimeout(timer);
+      console.error(`[claude-router] provider "${name}" body read failed/timed out: ${String((e && e.message) || e).slice(0, 200)}`);
+      return { fallback: `provider-body:${name}` };
+    }
+    clearTimeout(timer);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(responseOpenaiToAnthropic(json, reportModel)));
+    return { ok: true };
   }
 }
 
@@ -335,8 +389,29 @@ function makeHandler(config, cache, logger, fallbackTracker) {
       }
       fallbackTracker(decision.log.decision);
 
-      if (openaiPlan) await forwardOpenai(openaiPlan, rawBody, res);
-      else await forward(config, req, body, res);
+      if (openaiPlan) {
+        const result = await forwardOpenai(openaiPlan, rawBody, res, config.providerTimeoutMs);
+        // Runtime fail-open: the provider failed BEFORE any response bytes were
+        // written (fetch threw/aborted or !ok). Serve via Anthropic with the ORIGINAL
+        // bytes/model. body === rawBody here (the rewrite branch is !openaiPlan-guarded).
+        if (result && result.fallback && !res.headersSent) {
+          try {
+            await logger.write({
+              ...decision.log,
+              decision: 'fallback',
+              fallback_reason: result.fallback,
+              provider: 'anthropic',
+              routed_model: decision.log.original_model,
+            });
+          } catch {
+            /* logging must never break a request */
+          }
+          fallbackTracker('fallback');
+          await forward(config, req, rawBody, res);
+        }
+      } else {
+        await forward(config, req, body, res);
+      }
     } catch (e) {
       // Covers: aborted upload, client destroying the socket mid-SSE, upstream
       // fetch failure, and upstream body iterator errors. Never let it escape.
