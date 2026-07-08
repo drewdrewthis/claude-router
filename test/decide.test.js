@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { decide, hasNonTextContent, buildDigest } = require('../lib/decide');
+const { decide, hasNonTextContent, hasSensitiveContent, buildDigest } = require('../lib/decide');
 
 const TIERS = { light: 'claude-haiku-4-5', standard: 'claude-sonnet-5', heavy: 'claude-opus-4-8' };
 
@@ -314,4 +314,74 @@ test('buildDigest: meta line carries an image count (images=1 with an image, ima
 
   const textBody = { messages: [{ role: 'user', content: 'just text' }] };
   assert.match(buildDigest(textBody, 7), /\[meta est_tokens=7 tools=0 thinking=false images=0\]/);
+});
+
+// ---------- privacy: high-confidence secret detection (fail-closed gate input) ----------
+
+test('hasSensitiveContent: true for AWS key / PEM private-key header / SSN; false for benign code + normal prompt', () => {
+  // TRUE: high-confidence credential shapes (canonical fakes only)
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: 'Is this AWS key still active? AKIAIOSFODNN7EXAMPLE' }] }),
+    true
+  );
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: [{ type: 'text', text: '-----BEGIN RSA PRIVATE KEY-----' }] }] }),
+    true
+  );
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: 'my ssn is 123-45-6789, can you validate the format?' }] }),
+    true
+  );
+
+  // the system prompt is scanned too
+  assert.strictEqual(
+    hasSensitiveContent({ system: 'deploy context: AKIAIOSFODNN7EXAMPLE', messages: [{ role: 'user', content: 'hi' }] }),
+    true
+  );
+  // text nested inside a tool_result is scanned too
+  assert.strictEqual(
+    hasSensitiveContent({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: 'grep found AKIAIOSFODNN7EXAMPLE' }] },
+          ],
+        },
+      ],
+    }),
+    true
+  );
+
+  // FALSE: benign code + a normal coding prompt (no credential shapes)
+  assert.strictEqual(hasSensitiveContent({ messages: [{ role: 'user', content: 'const x = skateboard;' }] }), false);
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: 'Write a debounce function in TypeScript with a configurable delay.' }] }),
+    false
+  );
+
+  // malformed / missing fields never throw -> false
+  assert.strictEqual(hasSensitiveContent({}), false);
+  assert.strictEqual(hasSensitiveContent(null), false);
+  assert.strictEqual(hasSensitiveContent({ messages: 'nope' }), false);
+});
+
+test('decide: stashes hasSensitive on the decision (true when a secret is present, false otherwise)', async () => {
+  const withSecret = await decide({
+    rawBody: Buffer.from(JSON.stringify({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'check AKIAIOSFODNN7EXAMPLE' }] })),
+    config: baseConfig(),
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+  });
+  assert.strictEqual(withSecret.hasSensitive, true);
+
+  const clean = await decide({
+    rawBody: Buffer.from(JSON.stringify({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'refactor this function' }] })),
+    config: baseConfig(),
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+  });
+  assert.strictEqual(clean.hasSensitive, false);
 });

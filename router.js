@@ -290,8 +290,9 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
 
 // Resolve a routed decision into a concrete forwarding plan. Routes fail OPEN (rewritten
 // to an Anthropic passthrough fallback, the reason recorded in the log) when the provider
-// is unknown/misconfigured, its credential env is missing, OR the request carries non-text
-// content a text-only provider cannot consume (the modality gate). Mutates decision.log.
+// is unknown/misconfigured, its credential env is missing, the request carries non-text
+// content a text-only provider cannot consume (the modality gate), OR the request text
+// carries a high-confidence secret (the privacy gate). Mutates decision.log.
 function planForward(config, decision) {
   const routed = decision.routed;
   if (!routed || routed.provider === 'anthropic') return null; // handled by Anthropic path
@@ -312,6 +313,15 @@ function planForward(config, decision) {
   // follow-up adds a per-provider/-model vision-capability check to permit vision routes.
   if (decision.hasNonText) {
     failOpen(decision, 'modality:non-text-to-text-model');
+    return null;
+  }
+  // PRIVACY GATE: a request whose text carries a high-confidence secret (API key, token,
+  // private key, SSN -- see hasSensitiveContent) must never reach a third-party provider.
+  // Fail closed to Anthropic (the account the client already trusts). Checked BEFORE the
+  // credential check so it diverts even with a valid provider key. False positives only
+  // forgo cheap routing (functionally safe); semantic PII is a future extension.
+  if (decision.hasSensitive) {
+    failOpen(decision, 'privacy:sensitive-content-to-thirdparty');
     return null;
   }
   if (!apiKey) {

@@ -74,6 +74,8 @@ const SUITE = [
   // PRIVACY-SENSITIVE (ideal: never leave premium/Anthropic; this suite shows the gap)
   { id: 'P1', group: 'privacy', expected: null, content: "Here's a dump of our customer records with names, emails and SSNs (e.g. 123-45-6789). Write a script to de-duplicate them by email." },
   { id: 'P2', group: 'privacy', expected: null, content: 'Review this config: it contains our production database password and Stripe secret key sk_live_FAKE_EXAMPLE_NOT_A_REAL_KEY. Is the structure right?' },
+  // Trivially phrased (classifies `light`) yet MUST gate: a canonical fake AWS access key id.
+  { id: 'P3', group: 'privacy', expected: null, content: 'Is this AWS key still active? AKIAIOSFODNN7EXAMPLE' },
 ];
 
 function makeBody(content) {
@@ -141,6 +143,7 @@ async function main() {
       routeA: routeStr(dec.routed),
       providerA: dec.routed ? dec.routed.provider : null,
       hasNonTextA: dec.hasNonText,
+      hasSensitiveA: dec.hasSensitive,
       error: errored,
     };
     process.stderr.write(`[stage1] A ${task.id} (${task.group}) -> ${dec.log.label} ${dec.log.classifier_ms != null ? dec.log.classifier_ms + 'ms' : ''}\n`);
@@ -231,12 +234,25 @@ async function main() {
     if (!ok) modalityPass = false;
   }
 
-  // 6. privacy gap: P1/P2 decision-level provider under config B
+  // 6. privacy gap: P1/P2/P3 decision-level provider under config B
   const privacy = {};
-  for (const id of ['P1', 'P2']) {
+  for (const id of ['P1', 'P2', 'P3']) {
     const r = rows[id];
     privacy[id] = { predicted: r.predicted, providerB: r.providerB, routeB: r.routeB };
   }
+
+  // 7. secret gate: which tasks tripped the fail-closed hasSensitive signal (a
+  // high-confidence credential / SSN shape in the request text). These divert to the
+  // Anthropic path in planForward regardless of tier -> the request never reaches a
+  // third-party provider. Config-independent, so phase A's value is authoritative.
+  const secretTripped = SUITE.filter((t) => rows[t.id].hasSensitiveA === true).map((t) => t.id);
+  const secretGate = {
+    tripped: secretTripped,
+    count: secretTripped.length,
+    by_task: Object.fromEntries(SUITE.map((t) => [t.id, rows[t.id].hasSensitiveA === true])),
+    gate: 'router.js planForward -> fallback_reason privacy:sensitive-content-to-thirdparty',
+    proven_by: 'test/proxy.test.js (privacy gate) + test/decide.test.js (hasSensitiveContent)',
+  };
 
   const out = {
     generated_at: new Date().toISOString(),
@@ -253,15 +269,16 @@ async function main() {
       per_tier: perTier,
       classifier_latency_ms: latency,
       configB_load_shift: loadShift,
-      modality_safety: { ...modality, pass: modalityPass, gate_ref: 'router.js:313', proven_by: 'test/proxy.test.js:646' },
+      modality_safety: { ...modality, pass: modalityPass, gate_ref: 'router.js:314', proven_by: 'test/proxy.test.js:646' },
       privacy_gap: privacy,
+      secret_gate: secretGate,
     },
     tasks: SUITE.map((t) => {
       const r = rows[t.id];
       return {
         id: r.id, group: r.group, expected: r.expected, predicted: r.predicted,
         match: r.match != null ? r.match : null,
-        routeA: r.routeA, routeB: r.routeB, hasNonText: r.hasNonTextA,
+        routeA: r.routeA, routeB: r.routeB, hasNonText: r.hasNonTextA, hasSensitive: r.hasSensitiveA,
         decisionA: r.decisionA, decisionB: r.decisionB,
         classifier_ms: r.classifier_ms, error: r.error, fallback_reason: r.fallback_reason,
       };
@@ -289,7 +306,8 @@ async function main() {
   L(`\nConfig B load-shift: ${loadShift.to_free_nvidia}/${loadShift.total} = ${loadShift.pct_free}% -> free (nvidia); ${loadShift.premium_opus}/${loadShift.total} = ${loadShift.pct_premium}% stay premium (opus)`);
   L(`\nModality safety: M1 hasNonText A/B=${modality.M1.hasNonTextA}/${modality.M1.hasNonTextB}, M2 A/B=${modality.M2.hasNonTextA}/${modality.M2.hasNonTextB} -> ${modalityPass ? 'PASS' : 'FAIL'}`);
   L(`\nPrivacy gap (Config B decision-level provider):`);
-  for (const id of ['P1', 'P2']) L(`  ${id}: predicted=${privacy[id].predicted}  provider=${privacy[id].providerB}  route=${privacy[id].routeB}`);
+  for (const id of ['P1', 'P2', 'P3']) L(`  ${id}: predicted=${privacy[id].predicted}  provider=${privacy[id].providerB}  route=${privacy[id].routeB}`);
+  L(`\nSecret gate (fail-closed hasSensitive tripped): ${secretGate.count} -> [${secretGate.tripped.join(', ')}]`);
   L('\nMismatches (predicted != expected):');
   const misses = lsh.filter((r) => !r.match);
   if (!misses.length) L('  (none)');
