@@ -191,3 +191,9 @@ provider the request was routed to (`anthropic` for all passthrough/fallback).
   `stream:true` and returns a single JSON body, it is buffered and re-emitted as a
   single-shot Anthropic event stream, so a streaming client still receives a valid,
   non-empty stream (an unparseable body yields a valid, empty terminated stream).
+
+## Evaluation
+
+An offline routing eval lives in [`eval/`](eval/): it drives the shipped `decide()` / `classify()` product code over a small labeled suite (light / standard / heavy plus modality and privacy cases) at the **decision level only** — no provider is ever contacted — authenticating the classifier with the local Max OAuth token. Run it with `node eval/stage1-routing.js`.
+
+**Status:** the routing brain is validated offline (~82% tier accuracy, heavy-tier detection reliable, deterministic at `temperature: 0`). Free-model *adequacy* and end-to-end answer quality are **not** yet tested, and there is **no content-sensitivity / privacy gate** — sensitive content can still be routed to a free provider on complexity alone.
