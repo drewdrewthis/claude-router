@@ -1,0 +1,29 @@
+name: CI
+
+# Runs on every push and on every PR, including draft PRs: the test job is the
+# gate the PR relies on, so it must never be skipped for draft state.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the oldest LTS with a stable node:test runner and Readable.fromWeb.
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No dependencies and no network: the suite spins loopback mock upstreams.
+      # `node --test` discovers test/*.test.js; eval/ needs live credentials and
+      # is deliberately not run here.
+      - run: node --test
