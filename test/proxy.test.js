@@ -1185,3 +1185,44 @@ test('the default upstreamTimeoutMs sits BELOW undici headersTimeout, or it can 
     `upstreamTimeoutMs default ${DEFAULTS.upstreamTimeoutMs} >= undici's 300000ms headersTimeout — it would never fire`
   );
 });
+
+test('stream requested but provider sends non-SSE headers then STALLS the body fails open within timeout', async () => {
+  // Regression for the sibling of the error-body hang: on the stream path we used to
+  // clear the timer and writeHead(200) BEFORE reading a non-SSE JSON body. A provider
+  // that answered stream:true with content-type: application/json and then stalled hung
+  // the client forever with fail-open no longer possible.
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  const prov = await startProviderMock(({ res }) => {
+    // Non-SSE content-type, headers sent, body never completes.
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"choices":');
+    // never res.end()
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({
+    config: providerConfig(prov.url, { providerTimeoutMs: 400 }),
+    upstream: anth.url,
+    logFile,
+  });
+
+  const t0 = Date.now();
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', stream: true, messages: [{ role: 'user', content: 'route then stall' }] }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 200, 'client must get the Anthropic fallback, not a hang');
+  assert.ok(elapsed >= 350 && elapsed < 8000, `should fail open near providerTimeoutMs, took ${elapsed}ms`);
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1, 'exactly one Anthropic fallback');
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet');
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.strictEqual(lines[lines.length - 1].fallback_reason, 'provider-body:mockai');
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});

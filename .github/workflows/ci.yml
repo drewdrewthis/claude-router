@@ -20,6 +20,9 @@ jobs:
         node: ['20', '22', '24']
     steps:
       - uses: actions/checkout@v4
+        with:
+          # This job executes repository code; don't leave the token in .git/config.
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}

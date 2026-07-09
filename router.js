@@ -232,7 +232,7 @@ async function forward(config, req, body, res) {
   for (const [k, v] of Object.entries(req.headers)) if (!HOP_REQ.has(k)) headers[k] = v;
 
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), config.upstreamTimeoutMs ?? 600000);
+  const timer = setTimeout(() => ac.abort(), config.upstreamTimeoutMs ?? DEFAULTS.upstreamTimeoutMs);
   let upstream;
   try {
     upstream = await fetch(config.upstream + req.url, {
@@ -278,14 +278,16 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
   // rebuilds the reverse map so the client sees back the names it declared.
   const toolNames = toolNameMap(anthropicBody.tools);
 
-  // Bound the provider request with an AbortController on `timeoutMs`. Once headers
-  // arrive we branch on stream vs non-stream:
-  //   STREAM: clear the timer immediately so a legitimately long streaming body is
-  //           never aborted mid-flight (providers send headers before generating).
-  //   NON-STREAM: keep the timer ARMED through the body read (`provRes.json()`) below,
-  //           so a provider that sends 200 + headers then stalls its body still fails
-  //           open within `timeoutMs` instead of hanging the client (no client bytes
-  //           written yet). A pre-bytes failure returns a fallback descriptor.
+  // Bound the provider request with an AbortController on `timeoutMs`. The timer is
+  // released only once we are committed to streaming a body we cannot re-serve:
+  //   ERROR (!ok):    stays armed across the bounded error-body read, always.
+  //   REAL SSE:       released just before the (legitimately long) event stream, since
+  //                   providers send headers before generating.
+  //   NON-SSE / NON-STREAM: stays ARMED through the body read (`provRes.json()`), so a
+  //                   provider that sends 200 + headers then stalls its body fails open
+  //                   within `timeoutMs` instead of hanging the client. In both cases
+  //                   the read happens BEFORE any client bytes are written, so a
+  //                   fallback descriptor is still possible.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   let provRes;
@@ -316,25 +318,37 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
     return { fallback: `provider-http-${provRes.status}` };
   }
 
-  if (stream) clearTimeout(timer); // stream: unbind before the (long) body streams
-
   if (stream) {
-    // The client asked for streaming, so we always answer with SSE.
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     const ctype = provRes.headers.get('content-type') || '';
     if (!ctype.includes('text/event-stream')) {
       // Provider ignored stream:true and returned a single JSON body: buffer it and
       // re-envelope as a one-shot Anthropic stream (never an empty/hung stream).
+      //
+      // This is NOT the long streaming body, so the timer stays ARMED across the read
+      // and we do not commit response headers until the body resolves. Previously the
+      // timer was cleared and `writeHead` ran first, so a provider that answered
+      // `stream:true` with `content-type: application/json` and then stalled hung the
+      // client forever with fail-open no longer possible (headers already sent).
       let json = null;
+      let read = true;
       try {
         json = await provRes.json();
-      } catch {
-        json = null;
+      } catch (e) {
+        read = false;
+        console.error(
+          `[claude-router] provider "${name}" non-SSE stream body read failed/timed out: ` +
+            String((e && e.message) || e).slice(0, 200)
+        );
       }
+      clearTimeout(timer);
+      if (!read) return { fallback: `provider-body:${name}` }; // no bytes written yet
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       for (const ev of singleShotSSE(json, reportModel, toolNames)) res.write(ev);
       res.end();
       return { ok: true };
     }
+    clearTimeout(timer); // real SSE: unbind before the (long) body streams
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     const rawChunks = provRes.body ? Readable.fromWeb(provRes.body) : [];
     for await (const ev of streamOpenaiToAnthropic(rawChunks, reportModel, toolNames)) res.write(ev);
     res.end();

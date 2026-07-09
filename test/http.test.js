@@ -65,3 +65,29 @@ test('readCappedText: default cap is the nginx-style 8 KiB proxy_buffer_size', a
   const { response } = endlessResponse();
   assert.strictEqual((await readCappedText(response)).length, 8192);
 });
+
+test('readCappedText: an all-empty-chunk stream self-terminates (no external abort needed)', async () => {
+  // A stream that yields only zero-length chunks would never advance `total`. The
+  // function must terminate on its own — a future caller may not arm an abort timer.
+  let pulls = 0;
+  const body = new ReadableStream({
+    pull(c) {
+      pulls++;
+      if (pulls > 100000) { c.close(); return; } // safety net; should never be hit
+      c.enqueue(new Uint8Array(0));
+    },
+  });
+  const text = await readCappedText({ body }, 8192);
+  assert.strictEqual(text, '');
+  assert.ok(pulls < 1000, `should stop after a small bounded number of empty reads, did ${pulls}`);
+});
+
+test('readCappedText: empty chunks interleaved with real bytes still return the real bytes', async () => {
+  const enc = new TextEncoder();
+  const parts = [new Uint8Array(0), enc.encode('re'), new Uint8Array(0), enc.encode('al'), new Uint8Array(0)];
+  let i = 0;
+  const body = new ReadableStream({
+    pull(c) { if (i < parts.length) c.enqueue(parts[i++]); else c.close(); },
+  });
+  assert.strictEqual(await readCappedText({ body }, 8192), 'real');
+});

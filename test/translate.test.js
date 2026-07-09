@@ -826,3 +826,33 @@ test('stream: three interleaved tools each keep a stable block, all closed in as
   }
   assert.deepStrictEqual(byBlock, { 0: '{"x":1}', 1: '{"y":2}', 2: '{"z":3}' });
 });
+
+// ---------- review follow-ups: null body guard + streaming UTF-8 ----------
+
+test('response: a null provider body degrades to an empty assistant message, does not throw', () => {
+  // A provider answering 200 with a literal `null`. Must not throw AFTER headers are
+  // written (matches singleShotSSE, which already null-guards).
+  const out = responseOpenaiToAnthropic(null, 'p/m');
+  assert.strictEqual(out.type, 'message');
+  assert.strictEqual(out.role, 'assistant');
+  assert.deepStrictEqual(out.content, [{ type: 'text', text: '' }]);
+  assert.strictEqual(out.stop_reason, 'end_turn');
+  // Non-object bodies too.
+  assert.doesNotThrow(() => responseOpenaiToAnthropic('nonsense', 'p/m'));
+  assert.doesNotThrow(() => responseOpenaiToAnthropic(42, 'p/m'));
+});
+
+test('stream: a multibyte codepoint split across two chunks is NOT corrupted', async () => {
+  // '😀' is F0 9F 98 80. Split it 2 bytes / 2 bytes across chunk boundaries. Decoding
+  // each chunk independently would yield replacement chars; a streaming decoder must not.
+  const full = Buffer.from(JSON.stringify({ choices: [{ delta: { content: '😀' } }] }) + '\n\n', 'utf8');
+  const marker = Buffer.from('data: ', 'utf8');
+  const line = Buffer.concat([marker, full]);
+  // Find the emoji's byte offset and split inside it.
+  const emojiByte = line.indexOf(0xf0);
+  const chunks = [line.subarray(0, emojiByte + 2), line.subarray(emojiByte + 2)];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  const joined = events.join('');
+  assert.ok(joined.includes('😀'), 'split emoji must reassemble intact');
+  assert.ok(!joined.includes('�'), 'no U+FFFD replacement chars');
+});

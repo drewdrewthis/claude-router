@@ -517,3 +517,67 @@ test('the session id is never written into the decision log', async () => {
   });
   assert.ok(!JSON.stringify(d.log).includes('super-secret-session'));
 });
+
+// ---------- privacy gate: tool_use.input is on the provider wire, so it must be scanned ----------
+
+test('hasSensitiveContent: a secret inside tool_use.input trips the gate (Bash/Write payloads)', () => {
+  // Claude Code's dominant tool shape puts the payload in `input`, which has no `.text`
+  // field — and translate.js serializes it verbatim into tool_calls[].function.arguments.
+  const bash = {
+    messages: [
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'Bash',
+          input: { command: 'echo AKIAIOSFODNN7EXAMPLE >> ~/.aws/credentials' } },
+      ]},
+    ],
+  };
+  assert.strictEqual(hasSensitiveContent(bash), true);
+
+  const write = {
+    messages: [
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 't2', name: 'Write',
+          input: { file_path: '/x/.env', content: 'GH_TOKEN=ghp_' + 'A'.repeat(36) } },
+      ]},
+    ],
+  };
+  assert.strictEqual(hasSensitiveContent(write), true);
+});
+
+test('hasSensitiveContent: a benign tool_use.input does NOT trip the gate', () => {
+  assert.strictEqual(
+    hasSensitiveContent({
+      messages: [{ role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls -la && npm test' } },
+      ]}],
+    }),
+    false
+  );
+});
+
+test('hasSensitiveContent: unserializable tool_use.input degrades to false, never throws', () => {
+  const circular = { a: 1 };
+  circular.self = circular;
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'assistant', content: [{ type: 'tool_use', input: circular }] }] }),
+    false
+  );
+});
+
+test('everything translate.js puts on the wire is covered by the gate (contract, not sampling)', () => {
+  // The gate's scan surface must equal translate.js's forwarding surface. If a future
+  // block type starts being forwarded, this test is where the omission should surface.
+  const KEY = 'AKIAIOSFODNN7EXAMPLE';
+  const carriers = [
+    ['system string', { system: `key ${KEY}`, messages: [] }],
+    ['system blocks', { system: [{ type: 'text', text: `key ${KEY}` }], messages: [] }],
+    ['user string', { messages: [{ role: 'user', content: `key ${KEY}` }] }],
+    ['user text block', { messages: [{ role: 'user', content: [{ type: 'text', text: `key ${KEY}` }] }] }],
+    ['tool_result string', { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: `key ${KEY}` }] }] }],
+    ['tool_result blocks', { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: [{ type: 'text', text: `key ${KEY}` }] }] }] }],
+    ['tool_use input', { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: { command: KEY } }] }] }],
+  ];
+  for (const [label, body] of carriers) {
+    assert.strictEqual(hasSensitiveContent(body), true, `${label} must trip the privacy gate`);
+  }
+});
