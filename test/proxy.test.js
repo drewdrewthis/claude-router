@@ -969,3 +969,219 @@ test('non-stream provider that sends headers then stalls the body fails open to 
   await prov.close();
   delete process.env.MOCKAI_KEY;
 });
+
+// ---------- forward() timeout (Anthropic passthrough leg) ----------
+
+// An upstream that accepts the request and then NEVER responds. Without a
+// time-to-headers timeout on forward(), the client socket hangs forever.
+function startBlackHoleUpstream() {
+  const sockets = [];
+  const server = http.createServer((req, res) => {
+    sockets.push(res);
+    req.on('data', () => {});
+    req.on('error', () => {});
+    res.on('error', () => {});
+    // deliberately never writeHead / never end
+  });
+  return new Promise((r) => {
+    server.listen(0, '127.0.0.1', () =>
+      r({
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () =>
+          new Promise((rr) => {
+            for (const res of sockets) { try { res.destroy(); } catch {} }
+            server.close(rr);
+          }),
+      })
+    );
+  });
+}
+
+test('forward: a hung upstream aborts at upstreamTimeoutMs and returns 502, never hangs the client', async () => {
+  const hole = await startBlackHoleUpstream();
+  const srv = await startServer({
+    config: baseConfig({ upstreamTimeoutMs: 300 }),
+    upstream: hole.url,
+    logFile: tmpLog(),
+  });
+
+  const t0 = Date.now();
+  // already-haiku => passthrough, so this exercises forward() with no classifier call.
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 502);
+  const env = JSON.parse(r.body.toString('utf8'));
+  assert.strictEqual(env.type, 'error');
+  assert.ok(elapsed >= 250, `should have waited out the timeout, took ${elapsed}ms`);
+  assert.ok(elapsed < 5000, `should not have hung, took ${elapsed}ms`);
+
+  await srv.close();
+  await hole.close();
+});
+
+test('forward: the timeout bounds time-to-HEADERS only — a slow SSE body streams to completion', async () => {
+  // Headers land fast, then the body dribbles for well past upstreamTimeoutMs. A
+  // total-duration timeout would truncate this; a time-to-headers timeout must not.
+  const slow = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: one\n\n');
+      setTimeout(() => {
+        res.write('data: two\n\n');
+        res.end();
+      }, 400); // > upstreamTimeoutMs below
+    });
+  });
+  await new Promise((r) => slow.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${slow.address().port}`;
+
+  const srv = await startServer({
+    config: baseConfig({ upstreamTimeoutMs: 200 }),
+    upstream: url,
+    logFile: tmpLog(),
+  });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  const body = r.body.toString('utf8');
+  assert.ok(body.includes('data: one'), 'first event missing');
+  assert.ok(body.includes('data: two'), 'stream was truncated by a total-duration timeout');
+
+  await srv.close();
+  await new Promise((rr) => slow.close(rr));
+});
+
+// ---------- bounded provider error-body read ----------
+
+test('provider 500 with an ENDLESS error body still fails open promptly (bounded read)', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  let stopped = false;
+  const prov = await startProviderMock(({ res }) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    const stop = () => { stopped = true; };
+    res.on('close', stop);
+    res.on('error', stop);
+    const pump = () => {
+      if (stopped || res.destroyed || res.writableEnded) return;
+      if (res.write('x'.repeat(65536))) setImmediate(pump);
+      else res.once('drain', pump);
+    };
+    pump();
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile });
+
+  const t0 = Date.now();
+  // stream:true is the path that previously cleared the abort timer BEFORE reading the
+  // error body, leaving the read unbounded in BOTH time and bytes.
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      stream: true,
+      messages: [{ role: 'user', content: 'route then 500 forever' }],
+    }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 200, 'client must get the Anthropic fallback, not a hang');
+  assert.ok(elapsed < 10000, `fail-open took ${elapsed}ms — the error body was not bounded`);
+
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.strictEqual(last.fallback_reason, 'provider-http-500');
+  assert.ok(stopped, 'the router must cancel the error body rather than drain it');
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+// ---------- tool-name limit, end to end through the provider leg ----------
+
+test('long MCP tool name: <=64 chars on the wire, original name restored to the client', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const LONG = 'mcp__langwatch_platform__list_simulation_runs_for_a_given_scenario_set';
+  assert.ok(LONG.length > 64);
+
+  const anth = await startMock({ label: 'heavy' });
+  let wireName = null;
+  const prov = await startProviderMock(({ req, res }) => {
+    const chunks = [];
+    // body already consumed by startProviderMock; re-read from its record below
+    void req;
+    void chunks;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id: 'cmpl-tool',
+        // Provider echoes the mangled name back, and reports finish_reason "stop"
+        // alongside tool_calls exactly as NVIDIA does.
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: { tool_calls: [{ id: 'call_1', function: { name: wireName, arguments: '{"a":1}' } }] },
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 1 },
+      })
+    );
+  });
+
+  // Patch: capture the wire name from the provider's received request before replying.
+  const origPush = prov.requests.push.bind(prov.requests);
+  prov.requests.push = (rec) => {
+    try {
+      const j = JSON.parse(rec.body.toString('utf8'));
+      if (j.tools && j.tools[0]) wireName = j.tools[0].function.name;
+    } catch {}
+    return origPush(rec);
+  };
+
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile: tmpLog() });
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'call the tool' }],
+      tools: [{ name: LONG, description: 'd', input_schema: { type: 'object' } }],
+    }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  assert.ok(wireName, 'provider never saw a tools[] entry');
+  assert.ok(wireName.length <= 64, `provider saw a ${wireName.length}-char name`);
+  assert.match(wireName, /^[a-zA-Z0-9_-]{1,64}$/);
+
+  const out = JSON.parse(r.body.toString('utf8'));
+  assert.strictEqual(out.content[0].type, 'tool_use');
+  assert.strictEqual(out.content[0].name, LONG, 'client must see the name it declared');
+  assert.strictEqual(out.stop_reason, 'tool_use', 'finish_reason "stop" + tool_calls must map to tool_use');
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('the default upstreamTimeoutMs sits BELOW undici headersTimeout, or it can never fire', () => {
+  // undici (Node's fetch engine) aborts at its own headersTimeout (300s, verified on
+  // this runtime as UND_ERR_HEADERS_TIMEOUT). A default at or above that is inert.
+  const { DEFAULTS } = require('../router');
+  assert.ok(
+    DEFAULTS.upstreamTimeoutMs < 300000,
+    `upstreamTimeoutMs default ${DEFAULTS.upstreamTimeoutMs} >= undici's 300000ms headersTimeout — it would never fire`
+  );
+});

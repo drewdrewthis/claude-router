@@ -385,3 +385,135 @@ test('decide: stashes hasSensitive on the decision (true when a secret is presen
   });
   assert.strictEqual(clean.hasSensitive, false);
 });
+
+// ---------- cache key: domain separation + session scoping ----------
+
+const { cacheKey, sessionIdFrom } = require('../lib/decide');
+
+test('cacheKey: concatenation-ambiguous field splits produce DIFFERENT keys', () => {
+  // The old key was sha256(sysText + firstContent), so ("ab","c") and ("a","bc")
+  // hashed identically. Encoding the fields unambiguously is the fix.
+  assert.notStrictEqual(cacheKey(null, 'ab', 'c'), cacheKey(null, 'a', 'bc'));
+  assert.notStrictEqual(cacheKey(null, '', 'xy'), cacheKey(null, 'x', 'y'));
+});
+
+test('cacheKey: same session + same content is stable; different sessions diverge', () => {
+  assert.strictEqual(cacheKey('s1', 'sys', 'first'), cacheKey('s1', 'sys', 'first'));
+  assert.notStrictEqual(cacheKey('s1', 'sys', 'first'), cacheKey('s2', 'sys', 'first'));
+  // A null session degrades to the content-only key, and is not the same as "no session".
+  assert.strictEqual(cacheKey(null, 'sys', 'first'), cacheKey('', 'sys', 'first'));
+});
+
+test('sessionIdFrom: header wins, metadata.user_id is the fallback, else null', () => {
+  const meta = { metadata: { user_id: 'uid-json-blob' } };
+  assert.strictEqual(sessionIdFrom(meta, { 'x-claude-code-session-id': 'sess-1' }), 'sess-1');
+  assert.strictEqual(sessionIdFrom(meta, {}), 'uid-json-blob');
+  assert.strictEqual(sessionIdFrom({}, {}), null);
+  assert.strictEqual(sessionIdFrom(null, null), null);
+  // Empty strings are not identities.
+  assert.strictEqual(sessionIdFrom({ metadata: { user_id: '' } }, { 'x-claude-code-session-id': '' }), null);
+});
+
+test('two DIFFERENT sessions with identical bodies each classify (no cross-session cache hit)', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = (sessionId) => ({
+    rawBody: bodyBuf({
+      model: 'claude-sonnet-4',
+      system: 'You are Claude Code.',
+      messages: [{ role: 'user', content: 'hello' }],
+    }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'heavy';
+    },
+    now: fixedClock(),
+    cache,
+    headers: { 'x-claude-code-session-id': sessionId },
+  });
+
+  const a = await decide(req('session-aaa'));
+  const b = await decide(req('session-bbb'));
+
+  assert.strictEqual(a.log.decision, 'routed');
+  assert.strictEqual(b.log.decision, 'routed', 'session B must not inherit session A cache entry');
+  assert.strictEqual(calls, 2);
+  assert.notStrictEqual(a.log.key, b.log.key);
+  assert.strictEqual(cache.size, 2);
+});
+
+test('the SAME session still gets stickiness (one classify, then cache-hit)', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = () => ({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'hello' }] }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'heavy';
+    },
+    now: fixedClock(),
+    cache,
+    headers: { 'x-claude-code-session-id': 'session-aaa' },
+  });
+  const a = await decide(req());
+  const b = await decide(req());
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(a.log.decision, 'routed');
+  assert.strictEqual(b.log.decision, 'cache-hit');
+});
+
+test('metadata.user_id scopes the cache when no session header is present', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = (uid) => ({
+    rawBody: bodyBuf({
+      model: 'claude-sonnet-4',
+      messages: [{ role: 'user', content: 'hello' }],
+      metadata: { user_id: uid },
+    }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'light';
+    },
+    now: fixedClock(),
+    cache,
+  });
+  await decide(req('{"session_id":"one"}'));
+  await decide(req('{"session_id":"two"}'));
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(cache.size, 2);
+});
+
+test('no session identity at all -> previous content-only behaviour (still sticky)', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = () => ({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'hello' }] }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'light';
+    },
+    now: fixedClock(),
+    cache,
+  });
+  await decide(req());
+  const b = await decide(req());
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(b.log.decision, 'cache-hit');
+});
+
+test('the session id is never written into the decision log', async () => {
+  const d = await decide({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'hi' }] }),
+    config: baseConfig(),
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+    headers: { 'x-claude-code-session-id': 'super-secret-session' },
+  });
+  assert.ok(!JSON.stringify(d.log).includes('super-secret-session'));
+});

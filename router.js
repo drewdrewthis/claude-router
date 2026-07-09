@@ -16,11 +16,13 @@ const { pipeline } = require('node:stream/promises');
 const { decide } = require('./lib/decide');
 const { classify } = require('./lib/classify');
 const { createLogger } = require('./lib/log');
+const { readCappedText, ERROR_BODY_MAX_BYTES } = require('./lib/http');
 const {
   requestAnthropicToOpenai,
   responseOpenaiToAnthropic,
   streamOpenaiToAnthropic,
   singleShotSSE,
+  toolNameMap,
 } = require('./lib/translate');
 
 const DEFAULTS = {
@@ -31,6 +33,11 @@ const DEFAULTS = {
   classifierTimeoutMs: 3000,
   maxHaikuInputTokens: 150000,
   providerTimeoutMs: 30000,
+  // Bounds time-to-response-headers on the Anthropic passthrough leg only (see
+  // forward()). Deliberately just under UNDICI_HEADERS_TIMEOUT_MS so OUR bound is the
+  // one that fires. Generous, because a non-stream completion withholds headers until
+  // it is fully generated — do not confuse this with providerTimeoutMs.
+  upstreamTimeoutMs: 240000,
   upstream: 'https://api.anthropic.com',
   port: 3456,
   providers: {
@@ -47,6 +54,21 @@ const DEFAULTS = {
 // fail-closed startup error: a redirected upstream would receive the caller's
 // Anthropic auth headers. Loopback stays allowed so local dev/tests work.
 const ALLOWED_UPSTREAM_HOSTS = ['api.anthropic.com', '127.0.0.1', 'localhost'];
+
+// undici (the engine behind Node's global `fetch`) applies its own `headersTimeout`,
+// default 300_000 ms, and there is no stdlib-only way to raise it — `fetch` would need
+// a custom `dispatcher`, which means depending on `undici` directly. Verified on this
+// runtime: a black-hole upstream rejects at ~300.7s with `UND_ERR_HEADERS_TIMEOUT`.
+//
+// Consequence: any `upstreamTimeoutMs` at or above this is a NO-OP, because undici
+// aborts the fetch first. We therefore default below it and warn if an operator
+// configures above it.
+//
+// undici's sibling `bodyTimeout` (also 300_000 ms) is an INTER-CHUNK idle timeout —
+// the same guarantee as nginx `proxy_read_timeout` / envoy `stream_idle_timeout`. It
+// already covers "upstream sent headers then stalled mid-SSE", so we deliberately do
+// NOT hand-roll a body-idle timeout on top of it.
+const UNDICI_HEADERS_TIMEOUT_MS = 300000;
 
 // Hop-by-hop headers we must not relay. content-length is recomputed by fetch/node.
 // On the response side we also drop content-encoding: global fetch transparently
@@ -117,6 +139,15 @@ function validateConfig(config) {
     console.error(`[claude-router] NOTICE: forwarding to non-default upstream ${config.upstream}`);
   }
 
+  // A silently-inert config knob is exactly the class of bug this proxy exists to avoid.
+  if ((config.upstreamTimeoutMs ?? 0) >= UNDICI_HEADERS_TIMEOUT_MS) {
+    console.error(
+      `[claude-router] WARNING: upstreamTimeoutMs=${config.upstreamTimeoutMs} is at or above ` +
+        `undici's built-in ${UNDICI_HEADERS_TIMEOUT_MS}ms headersTimeout, so it will never fire — ` +
+        `the fetch aborts first. Lower it below ${UNDICI_HEADERS_TIMEOUT_MS} to take effect.`
+    );
+  }
+
   // Provider base_urls are operator-configured (implicitly allowlisted) but must
   // still be a parseable URL and https (loopback exempt so local dev/tests work).
   for (const [name, p] of Object.entries(config.providers || {})) {
@@ -179,14 +210,42 @@ async function readBody(req) {
 // Stream the upstream response back byte-for-byte with backpressure + cleanup via
 // pipeline (critical for SSE: first delta reaches the client before upstream
 // finishes). May throw — the handler's try/catch owns error/abort recovery.
+//
+// TIMEOUT SHAPE (nginx's proxy_connect_timeout / proxy_read_timeout split, which envoy
+// spells route-timeout vs stream_idle_timeout; forwardOpenai's stream branch already
+// does the same thing): bound TIME-TO-RESPONSE-HEADERS, unbind the moment they arrive,
+// and let an inter-chunk IDLE timeout guard the body. Never a total-duration timeout —
+// an SSE completion legitimately streams for minutes, and aborting mid-body would
+// truncate the client's answer.
+//
+// We hand-roll only the first half. The body-idle half is already provided by undici's
+// `bodyTimeout` (see UNDICI_HEADERS_TIMEOUT_MS) — checked, present, so not reinvented.
+//
+// What this actually buys: before, `forward()` set no bound of its own and silently
+// inherited undici's 300s `headersTimeout` — invisible, unconfigurable, and impossible
+// to tighten. Now the bound is explicit, configurable, and defaults below undici's so
+// it is the one that fires. A non-stream request withholds headers until the whole
+// completion is generated, so this must stay generous: its job is to stop a HUNG
+// upstream leaking the client socket, not to cap slow-but-healthy work.
 async function forward(config, req, body, res) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) if (!HOP_REQ.has(k)) headers[k] = v;
-  const upstream = await fetch(config.upstream + req.url, {
-    method: req.method,
-    headers,
-    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-  });
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), config.upstreamTimeoutMs ?? 600000);
+  let upstream;
+  try {
+    upstream = await fetch(config.upstream + req.url, {
+      method: req.method,
+      headers,
+      body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
+      signal: ac.signal,
+    });
+  } finally {
+    // Headers are in (or the fetch threw): unbind before any body streaming.
+    clearTimeout(timer);
+  }
+
   const outHeaders = {};
   for (const [k, v] of upstream.headers) if (!HOP_RES.has(k)) outHeaders[k] = v;
   res.writeHead(upstream.status, outHeaders);
@@ -215,6 +274,9 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
   }
   const stream = anthropicBody.stream === true;
   const openaiReq = requestAnthropicToOpenai(anthropicBody, model);
+  // Tool names are mangled on the way out (OpenAI's 64-char/charset limit); this
+  // rebuilds the reverse map so the client sees back the names it declared.
+  const toolNames = toolNameMap(anthropicBody.tools);
 
   // Bound the provider request with an AbortController on `timeoutMs`. Once headers
   // arrive we branch on stream vs non-stream:
@@ -239,15 +301,22 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
     console.error(`[claude-router] provider "${name}" fetch failed: ${String((e && e.message) || e).slice(0, 200)}`);
     return { fallback: `provider-fetch:${name}` };
   }
-  if (stream) clearTimeout(timer); // stream: unbind before the (long) body streams
-
+  // An ERROR body is never "the long streaming body", so it stays bounded in BOTH
+  // dimensions regardless of `stream`:
+  //   TIME  — the abort timer stays armed across the read (this is why the stream
+  //           branch's clearTimeout now happens AFTER this block, not before it;
+  //           previously a streaming request cleared the timer first and then read
+  //           the error body with no deadline at all).
+  //   BYTES — readCappedText stops at ERROR_BODY_MAX_BYTES and cancels the stream,
+  //           so a provider that answers 500 with a gigabyte cannot OOM the router.
   if (!provRes.ok) {
-    // Non-stream keeps the timer armed, so this error-body read is bounded too.
-    const detail = await provRes.text().catch(() => '');
-    if (!stream) clearTimeout(timer);
+    const detail = await readCappedText(provRes, ERROR_BODY_MAX_BYTES);
+    clearTimeout(timer);
     console.error(`[claude-router] provider "${name}" error ${provRes.status}: ${detail.slice(0, 200)}`);
     return { fallback: `provider-http-${provRes.status}` };
   }
+
+  if (stream) clearTimeout(timer); // stream: unbind before the (long) body streams
 
   if (stream) {
     // The client asked for streaming, so we always answer with SSE.
@@ -262,12 +331,12 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
       } catch {
         json = null;
       }
-      for (const ev of singleShotSSE(json, reportModel)) res.write(ev);
+      for (const ev of singleShotSSE(json, reportModel, toolNames)) res.write(ev);
       res.end();
       return { ok: true };
     }
     const rawChunks = provRes.body ? Readable.fromWeb(provRes.body) : [];
-    for await (const ev of streamOpenaiToAnthropic(rawChunks, reportModel)) res.write(ev);
+    for await (const ev of streamOpenaiToAnthropic(rawChunks, reportModel, toolNames)) res.write(ev);
     res.end();
     return { ok: true };
   } else {
@@ -283,7 +352,7 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
     }
     clearTimeout(timer);
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(responseOpenaiToAnthropic(json, reportModel)));
+    res.end(JSON.stringify(responseOpenaiToAnthropic(json, reportModel, toolNames)));
     return { ok: true };
   }
 }
@@ -367,6 +436,7 @@ function makeHandler(config, cache, logger, fallbackTracker) {
           classify: (digest) => classify({ digest, config, incomingHeaders: req.headers }),
           now: Date.now,
           cache,
+          headers: req.headers, // session scoping only (x-claude-code-session-id); never logged
         });
       } catch (e) {
         decision = {

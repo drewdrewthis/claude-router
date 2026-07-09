@@ -475,3 +475,354 @@ test('response: cached prompt tokens are subtracted from input_tokens (not doubl
   );
   assert.strictEqual(c.usage.input_tokens, 7);
 });
+
+// ---------- tool-name limit (OpenAI: ^[a-zA-Z0-9_-]{1,64}$) ----------
+
+const {
+  toOpenaiToolName,
+  toolNameMap,
+  usageToAnthropic,
+  stopReasonFor,
+  OPENAI_TOOL_NAME_MAX,
+} = require('../lib/translate');
+
+// A real Claude Code MCP tool name shape, 71 chars — over OpenAI's 64-char ceiling.
+const LONG_MCP = 'mcp__langwatch_platform__list_simulation_runs_for_a_given_scenario_set';
+
+test('toolName: a legal short name is left EXACTLY alone (the common case is untouched)', () => {
+  for (const n of ['Bash', 'get_weather', 'a-b_c9', 'x'.repeat(64)]) {
+    assert.strictEqual(toOpenaiToolName(n), n);
+  }
+});
+
+test('toolName: an over-long name is truncated to <=64 chars and stays charset-legal', () => {
+  assert.ok(LONG_MCP.length > OPENAI_TOOL_NAME_MAX, 'fixture must actually exceed the limit');
+  const m = toOpenaiToolName(LONG_MCP);
+  assert.ok(m.length <= OPENAI_TOOL_NAME_MAX, `mangled name too long: ${m.length}`);
+  assert.match(m, /^[a-zA-Z0-9_-]{1,64}$/);
+});
+
+test('toolName: illegal characters are replaced, and the mangle is deterministic', () => {
+  const a = toOpenaiToolName('bad name.with:chars!');
+  assert.match(a, /^[a-zA-Z0-9_-]{1,64}$/);
+  assert.strictEqual(a, toOpenaiToolName('bad name.with:chars!'));
+});
+
+test('toolName: two long names sharing a 55-char prefix do NOT collide after truncation', () => {
+  const p = 'mcp__server__' + 'x'.repeat(50);
+  const a = toOpenaiToolName(p + '_alpha');
+  const b = toOpenaiToolName(p + '_beta');
+  assert.notStrictEqual(a, b, 'truncation without a content hash would collide here');
+  assert.ok(a.length <= 64 && b.length <= 64);
+});
+
+test('toolName: reverse map restores the original name; a miss falls back to the wire name', () => {
+  const rev = toolNameMap([{ name: LONG_MCP }, { name: 'Bash' }]);
+  assert.strictEqual(rev.get(toOpenaiToolName(LONG_MCP)), LONG_MCP);
+  assert.strictEqual(rev.get('Bash'), 'Bash');
+  assert.strictEqual(rev.get('never_declared'), undefined);
+});
+
+test('request: long tool name is mangled in tools[], tool_choice, AND historical tool_use', () => {
+  const out = requestAnthropicToOpenai(
+    {
+      model: 'm',
+      tools: [{ name: LONG_MCP, description: 'd', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool', name: LONG_MCP },
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: LONG_MCP, input: { a: 1 } }] },
+      ],
+    },
+    'm'
+  );
+  const wire = toOpenaiToolName(LONG_MCP);
+  assert.strictEqual(out.tools[0].function.name, wire);
+  assert.strictEqual(out.tool_choice.function.name, wire);
+  // All three sites must agree, or the provider sees two names for one tool.
+  assert.strictEqual(out.messages[0].tool_calls[0].function.name, wire);
+  assert.ok(wire.length <= 64);
+});
+
+test('response: a mangled tool name is restored to the name the CLIENT declared', () => {
+  const rev = toolNameMap([{ name: LONG_MCP }]);
+  const out = responseOpenaiToAnthropic(
+    {
+      choices: [
+        {
+          finish_reason: 'tool_calls',
+          message: {
+            tool_calls: [
+              { id: 'c1', function: { name: toOpenaiToolName(LONG_MCP), arguments: '{}' } },
+            ],
+          },
+        },
+      ],
+    },
+    'p/m',
+    rev
+  );
+  assert.strictEqual(out.content[0].name, LONG_MCP);
+});
+
+test('stream: a mangled tool name is restored in content_block_start', async () => {
+  const rev = toolNameMap([{ name: LONG_MCP }]);
+  const wire = toOpenaiToolName(LONG_MCP);
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: wire, arguments: '{}' } }] } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m', rev));
+  const start = events.find((e) => /event: content_block_start/.test(e));
+  assert.strictEqual(dataOf(start).content_block.name, LONG_MCP);
+});
+
+// ---------- stop_reason: content wins over finish_reason ----------
+
+test('stopReasonFor: tool_use blocks upgrade end_turn, but never mask max_tokens', () => {
+  assert.strictEqual(stopReasonFor('stop', true), 'tool_use');
+  assert.strictEqual(stopReasonFor('stop', false), 'end_turn');
+  assert.strictEqual(stopReasonFor('tool_calls', true), 'tool_use');
+  assert.strictEqual(stopReasonFor('length', true), 'max_tokens');
+});
+
+test('response: provider emits tool_calls with finish_reason "stop" -> stop_reason is tool_use', () => {
+  // Regression: NVIDIA does exactly this (docs/live-nvidia-toolcall-proof.txt [TOOL-4]).
+  // Mapping it to end_turn makes the client end the turn instead of running the tool.
+  const out = responseOpenaiToAnthropic(
+    {
+      choices: [
+        {
+          finish_reason: 'stop',
+          message: { tool_calls: [{ id: 'c1', function: { name: 'get_weather', arguments: '{"city":"Paris"}' } }] },
+        },
+      ],
+    },
+    'nvidia/meta-llama'
+  );
+  assert.strictEqual(out.content[0].type, 'tool_use');
+  assert.strictEqual(out.stop_reason, 'tool_use');
+});
+
+test('stream: tool_call deltas with finish_reason "stop" -> message_delta stop_reason is tool_use', async () => {
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'f', arguments: '{}' } }] } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  const md = events.find((e) => /event: message_delta/.test(e));
+  assert.strictEqual(dataOf(md).delta.stop_reason, 'tool_use');
+});
+
+test('stream: a text-only stream still reports end_turn (no false tool_use upgrade)', async () => {
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'hi' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  const md = events.find((e) => /event: message_delta/.test(e));
+  assert.strictEqual(dataOf(md).delta.stop_reason, 'end_turn');
+});
+
+// ---------- thinking / reasoning blocks ----------
+
+test('request: thinking and redacted_thinking blocks are dropped, siblings survive', () => {
+  const out = requestAnthropicToOpenai(
+    {
+      model: 'm',
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'secret chain of thought', signature: 'sig-abc' },
+            { type: 'redacted_thinking', data: 'opaque-ciphertext' },
+            { type: 'text', text: 'visible answer' },
+          ],
+        },
+      ],
+    },
+    'm'
+  );
+  const wire = JSON.stringify(out);
+  assert.ok(!wire.includes('secret chain of thought'), 'thinking text must not reach the provider');
+  assert.ok(!wire.includes('opaque-ciphertext'), 'redacted_thinking must not reach the provider');
+  assert.ok(!wire.includes('sig-abc'), 'thinking signature must not reach the provider');
+  assert.deepStrictEqual(out.messages[0], { role: 'assistant', content: 'visible answer' });
+});
+
+test('request: an assistant turn of ONLY thinking blocks emits no message at all', () => {
+  const out = requestAnthropicToOpenai(
+    { model: 'm', messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 't' }] }] },
+    'm'
+  );
+  assert.deepStrictEqual(out.messages, []);
+});
+
+test('request: thinking + tool_use -> the tool_call survives, the thinking does not', () => {
+  const out = requestAnthropicToOpenai(
+    {
+      model: 'm',
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'ponder' },
+            { type: 'tool_use', id: 't1', name: 'f', input: {} },
+          ],
+        },
+      ],
+    },
+    'm'
+  );
+  assert.strictEqual(out.messages[0].tool_calls[0].function.name, 'f');
+  assert.ok(!JSON.stringify(out).includes('ponder'));
+});
+
+test('response: reasoning_content is dropped, never re-emitted as an unsigned thinking block', () => {
+  // We cannot mint Anthropic's `signature`; a fabricated thinking block would be echoed
+  // back by the client and rejected the first time a turn fails open to Anthropic.
+  const out = responseOpenaiToAnthropic(
+    {
+      choices: [
+        { finish_reason: 'stop', message: { content: 'the answer', reasoning_content: 'let me think...' } },
+      ],
+    },
+    'p/m'
+  );
+  assert.deepStrictEqual(out.content, [{ type: 'text', text: 'the answer' }]);
+  assert.ok(!out.content.some((b) => b.type === 'thinking'));
+  assert.ok(!JSON.stringify(out).includes('let me think'));
+});
+
+test('stream: delta.reasoning_content is dropped, visible text still streams', async () => {
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'hidden thoughts' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'visible' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  const joined = events.join('');
+  assert.ok(!joined.includes('hidden thoughts'), 'reasoning must not leak into the client stream');
+  assert.ok(joined.includes('visible'));
+  assert.strictEqual(eventTypes(events).filter((t) => t === 'content_block_start').length, 1);
+});
+
+// ---------- cache-token accounting ----------
+
+test('usage: cache_read/cache_creation are surfaced when the provider reports them', () => {
+  const u = usageToAnthropic({
+    prompt_tokens: 100,
+    completion_tokens: 10,
+    prompt_tokens_details: { cached_tokens: 40 },
+    cache_creation_input_tokens: 7,
+  });
+  // Anthropic's input_tokens excludes tokens "read from OR used to create a cache",
+  // so BOTH counters come off the OpenAI prompt_tokens total: 100 - 40 - 7 = 53.
+  assert.deepStrictEqual(u, {
+    input_tokens: 53,
+    output_tokens: 10,
+    cache_read_input_tokens: 40,
+    cache_creation_input_tokens: 7,
+  });
+  // And the three parts reconstruct the provider's full prompt count.
+  assert.strictEqual(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens, 100);
+});
+
+test('usage: a reported cached_tokens of 0 is honoured, not skipped by falsiness', () => {
+  const u = usageToAnthropic({
+    prompt_tokens: 9,
+    completion_tokens: 1,
+    prompt_tokens_details: { cached_tokens: 0 },
+    cache_read_input_tokens: 5,
+  });
+  assert.strictEqual(u.input_tokens, 9, 'cached_tokens:0 must win over the alias, not fall through to it');
+  assert.ok(!('cache_read_input_tokens' in u));
+});
+
+test('usage: cache_* keys are ABSENT when the provider reports no cache (no invented zeros)', () => {
+  const u = usageToAnthropic({ prompt_tokens: 7, completion_tokens: 2 });
+  assert.deepStrictEqual(u, { input_tokens: 7, output_tokens: 2 });
+  assert.ok(!('cache_read_input_tokens' in u));
+  assert.ok(!('cache_creation_input_tokens' in u));
+});
+
+test('usage: missing usage collapses to zeros rather than throwing', () => {
+  assert.deepStrictEqual(usageToAnthropic(undefined), { input_tokens: 0, output_tokens: 0 });
+  assert.deepStrictEqual(usageToAnthropic(null), { input_tokens: 0, output_tokens: 0 });
+});
+
+test('response: cache counters reach the Anthropic envelope', () => {
+  const out = responseOpenaiToAnthropic(
+    {
+      choices: [{ message: { content: 'x' } }],
+      usage: { prompt_tokens: 50, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 20 } },
+    },
+    'p/m'
+  );
+  assert.strictEqual(out.usage.input_tokens, 30);
+  assert.strictEqual(out.usage.cache_read_input_tokens, 20);
+});
+
+test('stream: final usage chunk carries cache counters into message_delta', async () => {
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'x' } }] })}\n\n`,
+    `data: ${JSON.stringify({
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 80, completion_tokens: 4, prompt_tokens_details: { cached_tokens: 30 } },
+    })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  const md = dataOf(events.find((e) => /event: message_delta/.test(e)));
+  assert.strictEqual(md.usage.input_tokens, 50);
+  assert.strictEqual(md.usage.cache_read_input_tokens, 30);
+  assert.strictEqual(md.usage.output_tokens, 4);
+});
+
+// ---------- streaming tool-index (landed in 0b2e3bd) — residual-edge verification ----------
+
+test('stream: a provider that OMITS tool_calls[].index keeps one block, not one per delta', async () => {
+  // The `lastToolKey` fallback exists for providers that skip `index`. If it regressed,
+  // each args fragment would open a fresh content block and the tool JSON would shatter.
+  const chunks = [
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ id: 'c1', function: { name: 'f', arguments: '{"a"' } }] } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ function: { arguments: ':1}' } }] } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  const starts = events.filter((e) => /event: content_block_start/.test(e));
+  const stops = events.filter((e) => /event: content_block_stop/.test(e));
+  assert.strictEqual(starts.length, 1, 'one tool => exactly one content block');
+  assert.strictEqual(stops.length, 1, 'every opened block is closed exactly once');
+  const partials = events
+    .filter((e) => /input_json_delta/.test(e))
+    .map((e) => dataOf(e).delta.partial_json)
+    .join('');
+  assert.strictEqual(partials, '{"a":1}', 'fragments must reassemble in order');
+});
+
+test('stream: three interleaved tools each keep a stable block, all closed in ascending order', async () => {
+  const d = (i, args, id, name) => ({
+    choices: [{ delta: { tool_calls: [{ index: i, ...(id ? { id, function: { name, arguments: args } } : { function: { arguments: args } }) }] } }],
+  });
+  const chunks = [
+    `data: ${JSON.stringify(d(0, '{"x"', 'c0', 'f0'))}\n\n`,
+    `data: ${JSON.stringify(d(1, '{"y"', 'c1', 'f1'))}\n\n`,
+    `data: ${JSON.stringify(d(2, '{"z"', 'c2', 'f2'))}\n\n`,
+    `data: ${JSON.stringify(d(1, ':2}'))}\n\n`,
+    `data: ${JSON.stringify(d(0, ':1}'))}\n\n`,
+    `data: ${JSON.stringify(d(2, ':3}'))}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
+  ];
+  const events = await collect(streamOpenaiToAnthropic(fromLines(chunks), 'p/m'));
+  assert.strictEqual(events.filter((e) => /content_block_start/.test(e)).length, 3);
+
+  const stopIdx = events.filter((e) => /content_block_stop/.test(e)).map((e) => dataOf(e).index);
+  assert.deepStrictEqual(stopIdx, [0, 1, 2], 'blocks close once each, ascending');
+
+  // Reassemble per block index: interleaving must not cross-contaminate.
+  const byBlock = {};
+  for (const e of events.filter((x) => /input_json_delta/.test(x))) {
+    const o = dataOf(e);
+    byBlock[o.index] = (byBlock[o.index] || '') + o.delta.partial_json;
+  }
+  assert.deepStrictEqual(byBlock, { 0: '{"x":1}', 1: '{"y":2}', 2: '{"z":3}' });
+});
