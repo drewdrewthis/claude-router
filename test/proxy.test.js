@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -490,6 +491,12 @@ test('decision log contains no message/prompt text (sentinel absent)', async () 
   });
   const contents = fs.readFileSync(logFile, 'utf8');
   assert.ok(!contents.includes(SENTINEL), 'log must not contain prompt text');
+  // The digest (embeds prompt text) and the full cacheKey live on the DECISION, never in the
+  // log line — pin that so a future refactor logging the wrong object is caught.
+  for (const line of contents.trim().split('\n').filter(Boolean).map(JSON.parse)) {
+    assert.equal('digest' in line, false, 'log line must not carry digest');
+    assert.equal('cacheKey' in line, false, 'log line must not carry cacheKey');
+  }
 
   await srv.close();
   await mock.close();
@@ -1225,4 +1232,200 @@ test('stream requested but provider sends non-SSE headers then STALLS the body f
   await anth.close();
   await prov.close();
   delete process.env.MOCKAI_KEY;
+});
+
+// Regression: server.close() alone WAITS for existing connections to end — including idle
+// keep-alive sockets, which Claude Code holds open to the proxy. Left unfixed, a Ctrl-C out
+// of an interactive REPL hangs the drain and orphans the router still holding the port, so
+// the next launch cannot bind. close() must reap idle sockets and resolve regardless. No
+// signals involved — this pins the closeIdleConnections() fix in startServer().close().
+test('close() resolves even when an idle keep-alive socket is held (no orphaned router)', async () => {
+  const srv = await startServer({
+    config: baseConfig(),
+    upstream: 'http://127.0.0.1:9', // loopback, allowlisted, never contacted (no request is sent)
+    logFile: tmpLog(),
+  });
+
+  // A raw TCP connection held idle (sends nothing) is a tracked, idle server connection —
+  // exactly what a keep-alive REPL client leaves behind.
+  const socket = net.connect(srv.port, '127.0.0.1');
+  socket.on('error', () => {}); // swallow the ECONNRESET when the server reaps this socket
+  await new Promise((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+
+  try {
+    // A regression (close() waiting on the idle socket) must fail LOUDLY, not hang the whole
+    // suite — bound it and reject if close() does not resolve promptly.
+    await Promise.race([
+      srv.close(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('close() hung on an idle keep-alive socket')), 3000)
+      ),
+    ]);
+  } finally {
+    socket.destroy();
+  }
+});
+
+// The rewrite-rejected fallback log line (and the noRewrite cache pin) are written AFTER
+// forward() serves the retry response, so a plain read right after the request can race them.
+// Poll the log (bounded) — markNoRewrite runs synchronously right after the awaited log write,
+// so once the line is on disk the pin is set too.
+async function waitForLogLine(logFile, predicate, timeoutMs = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+      const hit = lines.find(predicate);
+      if (hit) return hit;
+    } catch {
+      /* file may not exist yet */
+    }
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  return null;
+}
+
+test('a rewritten request that upstream 400s is retried once with the original bytes; client gets the retry response', async () => {
+  // 400 the rewritten model (haiku), 200 the original — Anthropic rejecting a param the rewrite
+  // target does not accept, then accepting the caller's original request.
+  const mock = await startMock({
+    label: 'light', // routes claude-sonnet-4 -> light tier (claude-haiku-4-5): a real rewrite
+    respond: ({ body, res }) => {
+      const model = safeModel(body.toString('utf8'));
+      if (model === 'claude-haiku-4-5') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'This model does not support the effort parameter.' } }));
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, seen_model: model }));
+      }
+    },
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: baseConfig(), upstream: mock.url, logFile });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json', 'x-api-key': 'test', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'trivial ask' }] }),
+  });
+
+  assert.strictEqual(r.status, 200); // client received the retry's success, not the 400
+  const fwd = mock.forwarded();
+  assert.strictEqual(fwd.length, 2); // rewritten attempt + exactly one retry
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-haiku-4-5'); // rewritten first
+  assert.strictEqual(safeModel(fwd[1].body.toString('utf8')), 'claude-sonnet-4'); // retry: ORIGINAL bytes/model
+
+  const line = await waitForLogLine(logFile, (l) => l.fallback_reason === 'rewrite-rejected-400');
+  assert.ok(line, 'a rewrite-rejected-400 fallback line is logged');
+  assert.strictEqual(line.decision, 'fallback');
+  assert.strictEqual(line.provider, 'anthropic');
+  assert.strictEqual(line.routed_model, line.original_model);
+
+  await srv.close();
+  await mock.close();
+});
+
+test('a NON-rewritten request that 400s is not retried; the caller sees its own 400', async () => {
+  // Unconditional 400. The request is already-haiku (passthrough, no rewrite), so forward()
+  // must NOT retry — a genuine caller 400 reaches the caller unchanged.
+  const mock = await startMock({
+    respond: ({ res }) => {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'genuine caller error' } }));
+    },
+  });
+  const srv = await startServer({ config: baseConfig(), upstream: mock.url, logFile: tmpLog() });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json', 'x-api-key': 'test', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+
+  assert.strictEqual(r.status, 400); // caller's own 400 is not masked
+  assert.strictEqual(mock.forwarded().length, 1); // exactly one hit, no retry
+
+  await srv.close();
+  await mock.close();
+});
+
+test('after a rewrite-rejected 400, the next turn on the same cache key passes through unmodified', async () => {
+  const mock = await startMock({
+    label: 'light',
+    respond: ({ body, res }) => {
+      const model = safeModel(body.toString('utf8'));
+      if (model === 'claude-haiku-4-5') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'nope' } }));
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, seen_model: model }));
+      }
+    },
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: baseConfig(), upstream: mock.url, logFile });
+
+  const headers = { 'content-type': 'application/json', 'x-api-key': 'test', 'anthropic-version': '2023-06-01' };
+  const payload = JSON.stringify({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'same conversation turn' }] });
+
+  // Turn 1: rewrite -> 400 -> retry original -> 200; session pinned noRewrite.
+  const r1 = await request(srv.port, { headers, body: payload });
+  assert.strictEqual(r1.status, 200);
+  await waitForLogLine(logFile, (l) => l.fallback_reason === 'rewrite-rejected-400'); // pin is set once this lands
+  const afterTurn1 = mock.forwarded().length; // 2
+
+  // Turn 2: SAME cache key -> passthrough (no classify, no rewrite, one original-model hit).
+  const r2 = await request(srv.port, { headers, body: payload });
+  assert.strictEqual(r2.status, 200);
+  const turn2 = mock.forwarded().slice(afterTurn1);
+  assert.strictEqual(turn2.length, 1); // no 400+retry this time
+  assert.strictEqual(safeModel(turn2[0].body.toString('utf8')), 'claude-sonnet-4'); // original, unmodified
+
+  await srv.close();
+  await mock.close();
+});
+
+test('a role:system message is not routed to a no-system-role target; it passes through as capability-mismatch (one hit, no retry)', async () => {
+  // Classifier picks light (haiku), but haiku cannot serve a mid-conversation role:'system'
+  // message. We must NOT mutate content, so the router DECLINES pre-flight and forwards the
+  // original bytes untouched — exactly one upstream hit, no 400, no retry.
+  const mock = await startMock({
+    label: 'light',
+    respond: ({ body, res }) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, seen_model: safeModel(body.toString('utf8')) }));
+    },
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: baseConfig(), upstream: mock.url, logFile });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json', 'x-api-key': 'test', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4',
+      messages: [
+        { role: 'user', content: 'do a thing' },
+        { role: 'system', content: 'mid-conversation reminder' },
+      ],
+    }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  const fwd = mock.forwarded();
+  assert.strictEqual(fwd.length, 1); // declined pre-flight: one hit, no 400+retry
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-sonnet-4'); // ORIGINAL model, untouched
+
+  const line = await waitForLogLine(logFile, (l) => l.decision === 'capability-mismatch');
+  assert.ok(line, 'a capability-mismatch decision is logged');
+  assert.deepEqual(line.capability_blockers, ['system-role-message']);
+  assert.strictEqual(line.routed_model, line.original_model);
+  assert.strictEqual(line.provider, 'anthropic');
+  assert.strictEqual(line.label, 'light'); // classifier pick stays visible
+  assert.equal(/rewrite-rejected/.test(JSON.stringify(line)), false); // NOT a fallback/retry
+
+  await srv.close();
+  await mock.close();
 });

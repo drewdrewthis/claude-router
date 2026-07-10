@@ -9,6 +9,10 @@
   "upstreamTimeoutMs": 240000,
   "upstream": "https://api.anthropic.com",
   "port": 3456,
+  "telemetry": { "enabled": true, "captureContent": false },
+  "modelCapabilities": {
+    "claude-haiku-4-5": { "effort": false, "adaptiveThinking": false, "systemRole": false }
+  },
   "providers": {
     "anthropic": { "type": "anthropic" },
     "nvidia": {
