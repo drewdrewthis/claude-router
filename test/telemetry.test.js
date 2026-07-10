@@ -111,13 +111,24 @@ test('resolveTelemetryOptions: picks up LANGWATCH_API_KEY and enables', () => {
   assert.equal(o.endpoint, 'https://app.langwatch.ai/api/otel/v1/traces');
 });
 
-test('resolveTelemetryOptions: falls back to parsing OTEL_EXPORTER_OTLP_HEADERS', () => {
+test('resolveTelemetryOptions: adopts an OTEL_EXPORTER_OTLP_HEADERS token WHEN an endpoint is explicitly set', () => {
   const o = resolveTelemetryOptions(
     {},
-    { OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Bearer ' + KEY + ',x-extra=1' }
+    {
+      OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Bearer ' + KEY + ',x-extra=1',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://app.langwatch.ai/api/otel',
+    }
   );
   assert.equal(o.apiKey, KEY);
   assert.equal(o.enabled, true);
+});
+
+test('resolveTelemetryOptions: a scavenged OTEL token with NO explicit endpoint is NOT adopted (no misdirection)', () => {
+  // A stray OTEL Authorization header (meant for some other collector) must not be sent to
+  // LangWatch's default endpoint. With no LANGWATCH_API_KEY and no endpoint override -> adopt nothing.
+  const o = resolveTelemetryOptions({}, { OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Bearer stray-foreign-token' });
+  assert.equal(o.apiKey, '');
+  assert.equal(o.enabled, false);
 });
 
 test('resolveTelemetryOptions: disabled when no key resolves', () => {
@@ -408,4 +419,36 @@ test('shutdown() drains a sub-threshold queue the interval has not yet flushed',
   assert.equal(spans[0].name, 'claude_router.request');
   await t.shutdown(); // memoized promise: no second POST
   assert.equal(fetchImpl.calls.length, 1);
+});
+
+// ---------------- review hardenings: fail-closed content gate + fallback_reason allowlist ----------------
+
+test('captureContent:true + hasSensitive UNDEFINED -> fails CLOSED (no content, content_captured=false)', async () => {
+  const decision = sampleDecision({ hasSensitive: undefined });
+  const { fetchImpl } = await exportOne(sampleEntry({ decision }), { captureContent: true });
+  const spans = spansOf(fetchImpl.calls[0].body);
+  assert.equal(hasAttrAnywhere(spans, 'langwatch.input'), false);
+  assert.equal(hasAttrAnywhere(spans, 'langwatch.output'), false);
+  const rm = attrMap(findSpan(spans, 'claude_router.request'));
+  assert.equal(rm['router.content_captured'].boolValue, false);
+});
+
+test('router.fallback_reason is allowlisted: free-form -> "other", known reasons pass through', async () => {
+  // Free-form (the classifier-error String(err.message) path) must never reach the backend verbatim.
+  const freeform = sampleDecision({ log: { decision: 'fallback', fallback_reason: 'connect ECONNREFUSED 1.2.3.4:443 detail' } });
+  const a = await exportOne(sampleEntry({ decision: freeform }));
+  const rmA = attrMap(findSpan(spansOf(a.fetchImpl.calls[0].body), 'claude_router.request'));
+  assert.equal(rmA['router.fallback_reason'].stringValue, 'other');
+
+  // A known static reason passes through verbatim.
+  const known = sampleDecision({ log: { decision: 'fallback', fallback_reason: 'rewrite-rejected-400' } });
+  const b = await exportOne(sampleEntry({ decision: known }));
+  const rmB = attrMap(findSpan(spansOf(b.fetchImpl.calls[0].body), 'claude_router.request'));
+  assert.equal(rmB['router.fallback_reason'].stringValue, 'rewrite-rejected-400');
+
+  // A config/status-tail prefix (provider name / HTTP status — never content) passes through verbatim.
+  const prov = sampleDecision({ log: { decision: 'fallback', fallback_reason: 'provider-http-500' } });
+  const c = await exportOne(sampleEntry({ decision: prov }));
+  const rmC = attrMap(findSpan(spansOf(c.fetchImpl.calls[0].body), 'claude_router.request'));
+  assert.equal(rmC['router.fallback_reason'].stringValue, 'provider-http-500');
 });

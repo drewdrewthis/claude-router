@@ -36,7 +36,8 @@ except Exception:
 PY
 )"
 fi
-export LANGWATCH_API_KEY
+# NOT exported: the key is passed inline to the router process only (below), so the `claude`
+# subprocess never inherits it.
 
 if [ -z "${LANGWATCH_API_KEY:-}" ]; then
   echo "[claude-repl] WARNING: no LangWatch key found (set LANGWATCH_API_KEY, or add OTEL_EXPORTER_OTLP_HEADERS to ~/.claude/settings.json) — telemetry disabled; routing still works." >&2
@@ -49,8 +50,9 @@ fi
 
 export ROUTER_PORT="$PORT"
 
-# Start the router in the background; make sure it dies with us.
-node "$ROOT/router.js" &
+# Start the router in the background; make sure it dies with us. The LangWatch key is passed
+# INLINE so only the router sees it — it is never exported into `claude`'s environment.
+LANGWATCH_API_KEY="${LANGWATCH_API_KEY:-}" node "$ROOT/router.js" &
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true' EXIT INT TERM
 

@@ -624,9 +624,14 @@ function makeHandler(config, cache, logger, fallbackTracker, telemetry) {
         const ms = Date.now() - t0;
         if (fwd && fwd.rewriteRejected) {
           // Our rewrite drew a 400 and forward() re-served the caller's ORIGINAL bytes. The
-          // router owns that 400: record a fallback and pin this session to passthrough so we
-          // stop paying the 400+retry double round-trip on every subsequent turn.
+          // router owns that 400: pin this session to passthrough so we stop paying the
+          // 400+retry double round-trip on every subsequent turn, then record a fallback.
           rewriteRejected = true;
+          // Pin BEFORE the async log write: the pin is functional state and must not depend on
+          // log I/O (logging must never break a request), and this makes it observable the
+          // instant the fallback line lands rather than one appendFile-resolution tick later.
+          if (decision.cacheKey) markNoRewrite(cache, decision.cacheKey);
+          fallbackTracker('fallback');
           try {
             await logger.write({
               ...decision.log,
@@ -638,8 +643,6 @@ function makeHandler(config, cache, logger, fallbackTracker, telemetry) {
           } catch {
             /* logging must never break a request */
           }
-          fallbackTracker('fallback');
-          if (decision.cacheKey) markNoRewrite(cache, decision.cacheKey);
           upstream = {
             provider: 'anthropic',
             model: decision.log.original_model,

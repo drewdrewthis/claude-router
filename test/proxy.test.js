@@ -491,6 +491,12 @@ test('decision log contains no message/prompt text (sentinel absent)', async () 
   });
   const contents = fs.readFileSync(logFile, 'utf8');
   assert.ok(!contents.includes(SENTINEL), 'log must not contain prompt text');
+  // The digest (embeds prompt text) and the full cacheKey live on the DECISION, never in the
+  // log line — pin that so a future refactor logging the wrong object is caught.
+  for (const line of contents.trim().split('\n').filter(Boolean).map(JSON.parse)) {
+    assert.equal('digest' in line, false, 'log line must not carry digest');
+    assert.equal('cacheKey' in line, false, 'log line must not carry cacheKey');
+  }
 
   await srv.close();
   await mock.close();

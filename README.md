@@ -273,6 +273,8 @@ pre-flight because the target cannot serve the request's content unchanged; adds
 `capability_blockers`), `fallback` (adds `fallback_reason`, e.g. `provider-key-missing:<name>`
 or `rewrite-rejected-400`). `provider` names the
 provider the request was routed to (`anthropic` for all passthrough/fallback).
+`stripped` (when present) lists the dotted param paths the sanitizer removed to fit the rewrite
+target — e.g. `["output_config.effort","thinking"]`; like every field here it is metadata, never content.
 
 ## Known limitations
 
