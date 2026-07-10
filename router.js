@@ -17,6 +17,8 @@ const { decide } = require('./lib/decide');
 const { classify } = require('./lib/classify');
 const { createLogger } = require('./lib/log');
 const { readCappedText, ERROR_BODY_MAX_BYTES } = require('./lib/http');
+const { createTelemetry, resolveTelemetryOptions } = require('./lib/telemetry');
+const { sanitizeForModel, capabilityBlockers } = require('./lib/params');
 const {
   requestAnthropicToOpenai,
   responseOpenaiToAnthropic,
@@ -40,6 +42,12 @@ const DEFAULTS = {
   upstreamTimeoutMs: 240000,
   upstream: 'https://api.anthropic.com',
   port: 3456,
+  telemetry: { enabled: true, captureContent: false },
+  // MEASURED capability table (live API). Only claude-haiku-4-5 is measured; unlisted models
+  // carry NO claims (sanitizeForModel strips nothing for them) — the 400 retry is their net.
+  modelCapabilities: {
+    'claude-haiku-4-5': { effort: false, adaptiveThinking: false, systemRole: false },
+  },
   providers: {
     anthropic: { type: 'anthropic' },
     nvidia: {
@@ -99,6 +107,8 @@ function mergeConfig(base) {
     ...DEFAULTS,
     ...base,
     tiers: { ...DEFAULTS.tiers, ...(base.tiers || {}) },
+    telemetry: { ...DEFAULTS.telemetry, ...(base.telemetry || {}) },
+    modelCapabilities: { ...DEFAULTS.modelCapabilities, ...(base.modelCapabilities || {}) },
     providers: { ...DEFAULTS.providers, ...(base.providers || {}) },
   };
 }
@@ -227,23 +237,50 @@ async function readBody(req) {
 // it is the one that fires. A non-stream request withholds headers until the whole
 // completion is generated, so this must stay generous: its job is to stop a HUNG
 // upstream leaking the client socket, not to cap slow-but-healthy work.
-async function forward(config, req, body, res) {
+//
+// The rewrite-rejected 400 retry re-fetches with the caller's original bytes; BOTH the
+// initial attempt and the retry go through boundedFetch, so neither loses the bound.
+async function forward(config, req, body, res, originalBody) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) if (!HOP_REQ.has(k)) headers[k] = v;
+  const method = req.method;
+  const noBody = method === 'GET' || method === 'HEAD';
 
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), config.upstreamTimeoutMs ?? DEFAULTS.upstreamTimeoutMs);
-  let upstream;
-  try {
-    upstream = await fetch(config.upstream + req.url, {
-      method: req.method,
-      headers,
-      body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-      signal: ac.signal,
-    });
-  } finally {
-    // Headers are in (or the fetch threw): unbind before any body streaming.
-    clearTimeout(timer);
+  // One upstream fetch, bounded to time-to-response-headers: bind before, unbind the instant
+  // headers arrive (finally/clearTimeout) so a long SSE body is never capped.
+  const boundedFetch = async (sendBody) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), config.upstreamTimeoutMs ?? DEFAULTS.upstreamTimeoutMs);
+    try {
+      return await fetch(config.upstream + req.url, {
+        method,
+        headers,
+        body: noBody ? undefined : sendBody,
+        signal: ac.signal,
+      });
+    } finally {
+      // Headers are in (or the fetch threw): unbind before any body streaming.
+      clearTimeout(timer);
+    }
+  };
+
+  let upstream = await boundedFetch(body);
+
+  // Fail-open on a 400 that OUR rewrite caused: the router mutated the request (a different
+  // model, and/or params sanitizeForModel had no measured basis to strip), so the router —
+  // not the caller — owns the resulting 400. Retry ONCE with the caller's original bytes and
+  // serve THAT. A non-rewritten body (no originalBody, or body === originalBody) is NEVER
+  // retried: a genuine caller 400 must reach the caller unchanged. Safe because we await the
+  // full response before writing any client bytes — nothing is committed yet.
+  let rewriteRejected = false;
+  if (upstream.status === 400 && !noBody && originalBody != null && body !== originalBody) {
+    try {
+      await upstream.body?.cancel(); // discard the rejected body; do not leak the stream
+    } catch {
+      /* ignore */
+    }
+    upstream = await boundedFetch(originalBody);
+    rewriteRejected = true;
   }
 
   const outHeaders = {};
@@ -251,6 +288,7 @@ async function forward(config, req, body, res) {
   res.writeHead(upstream.status, outHeaders);
   if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), res);
   else res.end();
+  return { rewriteRejected };
 }
 
 // Translate the Anthropic request onto an OpenAI-compatible provider and forward.
@@ -345,14 +383,14 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       for (const ev of singleShotSSE(json, reportModel, toolNames)) res.write(ev);
       res.end();
-      return { ok: true };
+      return { ok: true, status: provRes.status, usage: null };
     }
     clearTimeout(timer); // real SSE: unbind before the (long) body streams
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     const rawChunks = provRes.body ? Readable.fromWeb(provRes.body) : [];
     for await (const ev of streamOpenaiToAnthropic(rawChunks, reportModel, toolNames)) res.write(ev);
     res.end();
-    return { ok: true };
+    return { ok: true, status: provRes.status, usage: null };
   } else {
     // Non-stream: the timer is still armed, so a stalled body aborts `.json()` and we
     // fail open (no client bytes written yet). Clear it once the body resolves.
@@ -365,9 +403,12 @@ async function forwardOpenai(plan, rawBody, res, timeoutMs) {
       return { fallback: `provider-body:${name}` };
     }
     clearTimeout(timer);
+    // Telemetry-only: the non-stream body carries usage; extract it trivially (no tee/buffer).
+    const u = json && json.usage;
+    const usage = u ? { input_tokens: u.prompt_tokens ?? null, output_tokens: u.completion_tokens ?? null } : null;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(responseOpenaiToAnthropic(json, reportModel, toolNames)));
-    return { ok: true };
+    return { ok: true, status: provRes.status, usage };
   }
 }
 
@@ -424,8 +465,33 @@ function failOpen(decision, reason) {
   decision.log.routed_model = decision.log.original_model;
 }
 
-function makeHandler(config, cache, logger, fallbackTracker) {
+// Pin a session-cache entry so subsequent turns pass through unmodified. Called after a
+// rewrite drew a 400 and we re-served original bytes — stops the 400+retry double round-trip
+// from repeating every turn. No-op if the entry was evicted (a later turn just re-classifies).
+function markNoRewrite(cache, key) {
+  const e = cache.get(key);
+  if (e) cache.set(key, { ...e, noRewrite: true });
+}
+
+// Pre-flight decline (NOT a fallback): the target model cannot serve this request's CONTENT
+// unchanged (see capabilityBlockers) and we refuse to mutate content, so we forward the
+// caller's ORIGINAL bytes. A DISTINCT decision so it reads as a deliberate no-route, not a
+// failure — and it is NOT recorded as a fallback (that counter detects a BROKEN router; this is
+// the router working correctly). `label` is preserved so the classifier's pick stays visible.
+function declineRewrite(decision, blockers) {
+  decision.routed = null;
+  decision.routedModel = null;
+  decision.rewrite = false;
+  decision.log.decision = 'capability-mismatch';
+  decision.log.capability_blockers = blockers;
+  decision.log.provider = 'anthropic';
+  decision.log.routed_model = decision.log.original_model;
+}
+
+function makeHandler(config, cache, logger, fallbackTracker, telemetry) {
   return async function handler(req, res) {
+    // Captured at entry so the telemetry root span covers the whole request.
+    const startMs = Date.now();
     // Swallow client-side disconnects (ECONNRESET/EPIPE) so an aborted socket
     // never surfaces as an unhandled 'error' event and crashes the process.
     req.on('error', () => {});
@@ -478,8 +544,22 @@ function makeHandler(config, cache, logger, fallbackTracker) {
       if (!openaiPlan && decision.rewrite && decision.routedModel) {
         try {
           const obj = JSON.parse(rawBody.toString('utf8'));
-          obj.model = decision.routedModel;
-          body = Buffer.from(JSON.stringify(obj));
+          // CAPABILITY GATE (content-level, pre-flight). Some incompatibilities cannot be fixed
+          // by stripping params because they live in conversation CONTENT (e.g. a
+          // mid-conversation role:'system' message Haiku rejects). Mutating content would change
+          // what the model is told, so we DECLINE to route and forward the ORIGINAL bytes. A
+          // deliberate no-route, NOT a failure (see declineRewrite) — zero wasted round-trips.
+          const blockers = capabilityBlockers(obj, decision.routedModel, config.modelCapabilities);
+          if (blockers.length) {
+            declineRewrite(decision, blockers); // body stays rawBody (original bytes/model)
+          } else {
+            obj.model = decision.routedModel;
+            // Reconcile model-specific params with the new target so our own rewrite does not
+            // draw a 400 (e.g. fable's output_config.effort / adaptive thinking on haiku).
+            const sane = sanitizeForModel(obj, decision.routedModel, config.modelCapabilities);
+            if (sane.stripped.length) decision.log.stripped = sane.stripped;
+            body = Buffer.from(JSON.stringify(sane.body));
+          }
         } catch {
           body = rawBody; // fail-open: never corrupt the forwarded request
         }
@@ -494,8 +574,15 @@ function makeHandler(config, cache, logger, fallbackTracker) {
       }
       fallbackTracker(decision.log.decision);
 
+      // `upstream` is the telemetry descriptor for whichever backend actually served the
+      // response (stays null only if we somehow reach neither path). `rewriteRejected` flips
+      // true iff our own rewrite drew a 400 and we re-served the caller's original bytes.
+      let upstream = null;
+      let rewriteRejected = false;
       if (openaiPlan) {
+        const t0 = Date.now();
         const result = await forwardOpenai(openaiPlan, rawBody, res, config.providerTimeoutMs);
+        const provMs = Date.now() - t0;
         // Runtime fail-open: the provider failed BEFORE any response bytes were
         // written (fetch threw/aborted or !ok). Serve via Anthropic with the ORIGINAL
         // bytes/model. body === rawBody here (the rewrite branch is !openaiPlan-guarded).
@@ -512,10 +599,84 @@ function makeHandler(config, cache, logger, fallbackTracker) {
             /* logging must never break a request */
           }
           fallbackTracker('fallback');
+          const t1 = Date.now();
           await forward(config, req, rawBody, res);
+          // The Anthropic re-serve is the real upstream for telemetry (original model).
+          upstream = {
+            provider: 'anthropic',
+            model: decision.log.original_model,
+            status: res.statusCode,
+            ms: Date.now() - t1,
+            usage: null,
+          };
+        } else {
+          upstream = {
+            provider: openaiPlan.name,
+            model: openaiPlan.model,
+            status: (result && result.status) || res.statusCode,
+            ms: provMs,
+            usage: (result && result.usage) || null,
+          };
         }
       } else {
-        await forward(config, req, body, res);
+        const t0 = Date.now();
+        const fwd = await forward(config, req, body, res, rawBody);
+        const ms = Date.now() - t0;
+        if (fwd && fwd.rewriteRejected) {
+          // Our rewrite drew a 400 and forward() re-served the caller's ORIGINAL bytes. The
+          // router owns that 400: record a fallback and pin this session to passthrough so we
+          // stop paying the 400+retry double round-trip on every subsequent turn.
+          rewriteRejected = true;
+          try {
+            await logger.write({
+              ...decision.log,
+              decision: 'fallback',
+              fallback_reason: 'rewrite-rejected-400',
+              provider: 'anthropic',
+              routed_model: decision.log.original_model,
+            });
+          } catch {
+            /* logging must never break a request */
+          }
+          fallbackTracker('fallback');
+          if (decision.cacheKey) markNoRewrite(cache, decision.cacheKey);
+          upstream = {
+            provider: 'anthropic',
+            model: decision.log.original_model,
+            status: res.statusCode,
+            ms,
+            usage: null,
+          };
+        } else {
+          upstream = {
+            provider: 'anthropic',
+            model: decision.log.routed_model,
+            status: res.statusCode,
+            ms,
+            usage: null,
+          };
+        }
+      }
+
+      // Fire-and-forget telemetry AFTER the response is served. Wrapped so a telemetry
+      // bug can never turn a served request into an error. classifier_ms/digest/label are
+      // present only when the classifier actually ran (decide stashes them on that path).
+      try {
+        telemetry.recordRequest({
+          decision,
+          classifierMs: decision.log.classifier_ms != null ? decision.log.classifier_ms : null,
+          digest: decision.digest,
+          label: decision.log.label,
+          classifierModel: config.classifierModel,
+          upstream,
+          rewriteRejected,
+          capabilityBlockers: decision.log.capability_blockers,
+          startMs,
+          endMs: Date.now(),
+          httpStatus: res.statusCode,
+        });
+      } catch {
+        /* telemetry must never break a request */
       }
     } catch (e) {
       // Covers: aborted upload, client destroying the socket mid-SSE, upstream
@@ -600,15 +761,37 @@ async function startServer(opts = {}) {
 
   const cache = new Map();
   const logger = createLogger(logFile);
-  const server = http.createServer(makeHandler(config, cache, logger, makeFallbackTracker()));
+  const telemetry = createTelemetry(resolveTelemetryOptions(config, process.env));
+  const server = http.createServer(makeHandler(config, cache, logger, makeFallbackTracker(), telemetry));
 
   await new Promise((r) => server.listen(port, '127.0.0.1', r));
   return {
     server,
     config,
+    telemetry,
     port: server.address().port,
     logFile,
-    close: () => new Promise((r) => server.close(r)),
+    // Drain the exporter on shutdown; close() drains it too so tests never leak the
+    // flush interval.
+    shutdown: () => telemetry.shutdown(),
+    close: () => {
+      // server.close() WAITS for every existing connection to end. closeIdleConnections()
+      // reaps ONLY keep-alive sockets between requests — MEASURED (node v22): a socket that
+      // connected but never sent a request is NOT in that idle set, so close()+reap alone
+      // still HANGS on it (~1.5s+ in isolation; closeAllConnections resolved 0ms). Claude
+      // Code holds such sockets open, orphaning the router on the port. So: stop accepting +
+      // reap true idle sockets immediately, then a short grace timer force-reaps whatever Node
+      // won't classify as idle (never-used sockets, still-streaming responses). We are exiting,
+      // so cutting an in-flight stream after the grace is correct. Telemetry flush follows.
+      const closed = new Promise((r) => server.close(r));
+      server.closeIdleConnections?.(); // Node 18.2+ — true idle keep-alives only
+      const grace = setTimeout(() => server.closeAllConnections?.(), 1000);
+      grace.unref();
+      return closed.then(() => {
+        clearTimeout(grace);
+        return telemetry.shutdown();
+      });
+    },
   };
 }
 
@@ -623,9 +806,38 @@ module.exports = {
 
 if (require.main === module) {
   startServer({})
-    .then(({ port, config }) => {
-      console.error(`[claude-router] listening on http://127.0.0.1:${port} -> ${config.upstream}`);
-      selfCheck(config);
+    .then((srv) => {
+      console.error(`[claude-router] listening on http://127.0.0.1:${srv.port} -> ${srv.config.upstream}`);
+      selfCheck(srv.config);
+
+      // A killed router (SIGINT/SIGTERM — e.g. bin/claude-repl's exit trap sends SIGTERM)
+      // otherwise exits on node's default handler with spans still queued, silently losing
+      // the LAST turn's trace — the one a user is most likely to go looking for. Drain on
+      // the way out: stop accepting connections + flush telemetry (bounded by
+      // EXPORT_TIMEOUT_MS and memoized), then exit. A second signal force-exits so an
+      // impatient operator can always ctrl-C out.
+      // A shutdown path that can block forever is worse than one that drops a span: an
+      // orphaned router keeps holding the port and breaks the next bin/claude-repl launch.
+      // close() already reaps idle sockets and telemetry.shutdown() is bounded by
+      // EXPORT_TIMEOUT_MS (5s); this hard cap only fires if a socket close is otherwise
+      // wedged (an in-flight request that never completes). Bound it so drain NEVER hangs.
+      const DRAIN_TIMEOUT_MS = 8000;
+      let draining = false;
+      const drain = async () => {
+        if (draining) process.exit(1); // second signal: force out now
+        draining = true;
+        const hardExit = setTimeout(() => process.exit(0), DRAIN_TIMEOUT_MS);
+        hardExit.unref();
+        try {
+          await srv.close(); // reap idle sockets, drain in-flight, then flush telemetry
+        } catch {
+          /* a telemetry/close failure must never keep the process from dying */
+        }
+        clearTimeout(hardExit);
+        process.exit(0);
+      };
+      process.on('SIGINT', drain);
+      process.on('SIGTERM', drain);
     })
     .catch((e) => {
       console.error('[claude-router] failed to start:', e);

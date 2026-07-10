@@ -8,6 +8,18 @@ conversation into a model tier (`light` / `standard` / `heavy`) with one cheap
 It **never breaks a request**: any internal failure (parse error, classifier
 timeout, unexpected label) forwards the original bytes unmodified — **fail-open**.
 
+> **Reality check — the light tier yields little to no savings for a *stock* Claude Code
+> session today.** Claude Code tailors every request to its **configured** model: betas,
+> `output_config.effort`, adaptive `thinking`, and a mid-conversation `role:"system"` message.
+> `claude-haiku-4-5` rejects several outright (measured, live API: `role 'system' is not
+> supported on this model`; `output_config.effort` → `400`; `adaptive thinking is not
+> supported`). The router strips the **params** it can safely reconcile, but it **refuses to
+> mutate conversation content** — so a turn carrying a `role:"system"` message is **declined
+> pre-flight** (`decision:"capability-mismatch"`) and forwarded on the original model. Routing
+> is only sound **between models of comparable capability**; for real savings, tier across
+> models that all support the features your client emits. See *Model-param reconciliation & the
+> capability gate* below.
+
 ## Why
 
 - **Rate-limit headroom (the real win on a Max subscription).** Trivial asks get
@@ -67,6 +79,7 @@ whose own credentials also fail.
 | `upstream` | `https://api.anthropic.com` | forward target |
 | `allowedUpstreamHosts` | `[]` | extra hostnames allowed as `upstream` (see below) |
 | `port` | `3456` | listen port |
+| `modelCapabilities` | `{ "claude-haiku-4-5": { "effort": false, "adaptiveThinking": false } }` | per-model param support (**measured**). A rewrite target's unsupported params are stripped before forwarding; an **unlisted model is assumed capable** (nothing stripped) and relies on the rewrite-rejected retry |
 
 > **Upstream allowlist (fail-closed).** On startup the router validates
 > `new URL(upstream).hostname` against `api.anthropic.com`, `127.0.0.1`,
@@ -125,6 +138,125 @@ non-Anthropic provider — a redirected upstream must not be able to harvest the
 Provider `base_url`s are validated at startup as parseable **https** URLs
 (loopback exempt for local dev), fail-closed.
 
+## Model-param reconciliation & the capability gate
+
+**Principle: strip params, never content — and when content is incompatible, decline to
+route.** A re-target can hit two kinds of incompatibility, handled by three layers:
+
+**0. Capability gate (pre-flight, content-level).** Some incompatibilities live in conversation
+**content**, which must not be mutated (it carries the caller's real instructions). Measured,
+live API, `claude-haiku-4-5`:
+
+| content the target rejects | result |
+|---|---|
+| a mid-conversation `role:"system"` message (`mid-conversation-system` beta) | `role 'system' is not supported on this model` → **declined** |
+
+If `capabilityBlockers` finds such content on a rewrite target, the router does **not** rewrite:
+it forwards the caller's original bytes untouched and logs `decision:"capability-mismatch"` with
+`capability_blockers` (telemetry root span: `router.capability_blockers`). This is a deliberate
+no-route — **not** a fallback, one upstream round-trip, zero waste — and it is not counted
+against the fallback health tracker. An unlisted model makes no claims (nothing is declined).
+
+The remaining two layers keep a rewrite from breaking the turn on **model-specific params** the
+new target rejects (e.g. `claude-fable-5`'s `output_config.effort` / adaptive thinking on
+`claude-haiku-4-5`):
+
+1. **Sanitize (proactive).** Before forwarding a rewritten body, params the target cannot
+   accept are stripped, per a **measured** capability table (`config.modelCapabilities`, keyed
+   by exact model id). Measured today (live API):
+
+   | param | `claude-haiku-4-5` |
+   |---|---|
+   | `output_config.effort` | rejected → stripped (drop `output_config` if it empties) |
+   | `thinking: {type:'adaptive'}` | rejected → dropped (never downgraded to a budget the caller never chose) |
+   | `thinking: {type:'enabled', budget_tokens}` | accepted → preserved |
+   | `context_management` `clear_thinking_*` edit | requires thinking → dropped when thinking is removed/absent; if that empties `edits`, `context_management` is dropped too |
+
+   **Dependency cascade.** Stripping a field cascades to whatever *depends* on it: removing
+   `thinking` also removes any `context_management` edit whose contract requires thinking (the
+   `clear_thinking_*` family, matched by family so a future dated variant is covered) —
+   otherwise the body is self-contradictory ("clear the thinking blocks" + "there is no
+   thinking") and Anthropic 400s.
+
+   **An unlisted model carries no capability claims — nothing is stripped for it.** Other
+   models were rate-limited and could not be measured; guessing would break requests they
+   accept. Layer 2 is their net.
+
+2. **Rewrite-rejected retry (reactive).** If a **rewritten** request still 400s (a param we
+   had no measured basis to strip), the router retries **once** with the caller's **original
+   bytes** (original model + params) and serves that response — the router mutated the request,
+   so the router, not the caller, owns the 400. A **non-rewritten** request that 400s is
+   **never** retried: a genuine caller 400 reaches the caller unchanged. The event is logged
+   (`decision:"fallback"`, `fallback_reason:"rewrite-rejected-400"`) and the session is pinned
+   so subsequent turns pass through unmodified (`rewrite-rejected-passthrough`) instead of
+   paying the 400+retry double round-trip every turn. Telemetry marks the root span
+   `router.rewrite_rejected=true`.
+
+## Telemetry (LangWatch)
+
+The router can emit an **OTLP trace per request** to [LangWatch](https://langwatch.ai) so
+you can see, per conversation, which tier each turn was routed to and why. It is
+**fire-and-forget**: telemetry never blocks, slows, or breaks a proxied request — every
+exporter error is swallowed and nothing is awaited in the request path. **Zero runtime
+dependencies** (OTLP/HTTP JSON over the built-in `fetch`).
+
+### Quickstart
+
+```sh
+bin/claude-repl
+```
+
+Starts the router, waits for it to bind, and launches `claude` pointed at it. The key is
+resolved from `LANGWATCH_API_KEY`, or failing that the `Authorization: Bearer …` token in
+`~/.claude/settings.json`'s `OTEL_EXPORTER_OTLP_HEADERS`. No key found → it prints a warning
+and runs **without** telemetry (routing still works). Pass `--capture-content` to opt into
+prompt capture (see below).
+
+> **Ingestion latency.** Traces are typically queryable within **seconds** (measured ~6s)
+> under `service.name = claude-router`. Note that **a `200` from the collector does not mean
+> the trace is queryable** — the OTLP POST can return `200` with `rejectedSpans: 0` yet the
+> span still be minutes from ingestion. If a trace does not appear, check
+> <https://status.langwatch.ai>: a degraded LangWatch **Processor** delays ingestion by many
+> minutes, and that failure mode looks identical to "instrumentation broken" — rule out a
+> Processor degradation before debugging your setup.
+
+### Config & env
+
+`config.json`:
+
+```json
+"telemetry": { "enabled": true, "captureContent": false }
+```
+
+| var | meaning |
+|-----|---------|
+| `LANGWATCH_API_KEY` | LangWatch ingestion key (`sk-lw-…`). Its presence enables telemetry. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | fallback key source — parsed for `Authorization=Bearer <tok>`. |
+| `LANGWATCH_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP base URL (default `https://app.langwatch.ai/api/otel`); the exporter POSTs to `<base>/v1/traces`. |
+| `ROUTER_TELEMETRY=0` | hard off-switch (overrides config). |
+| `ROUTER_TELEMETRY_CAPTURE_CONTENT=1` | opt into prompt capture (same as `config.telemetry.captureContent`). |
+
+Telemetry is **disabled** whenever no key resolves, `ROUTER_TELEMETRY=0`, or
+`config.telemetry.enabled === false`.
+
+### What a trace contains
+
+One trace per request: a root `claude_router.request` span (the routing decision — tier,
+provider, original/routed model, est. input tokens, cache hit, fallback reason, HTTP status)
+with child `claude_router.classifier` and `claude_router.upstream` LLM spans when those
+calls actually happened. The **root span never carries prompt text.**
+
+### Content capture is off by default (and gated even when on)
+
+By default **no prompt text leaves the process** — only routing metadata. `--capture-content`
+(or `captureContent: true`) attaches the classifier's input digest and label to the
+classifier span so you can inspect *what* was being routed. Even then, a turn whose text
+trips the **secret gate** (API key, token, private key, SSN — the same fail-closed detector
+that keeps secrets off third-party *model* providers) has its content **withheld**: that
+protection extends to a third-party *observability* backend too. `router.content_captured`
+on the root span records, per request, whether content was actually attached — so a
+deliberately withheld turn is visible as such.
+
 ## Decision log (`decisions.jsonl`, override via `ROUTER_LOG_FILE`)
 
 One JSON object per line. **Never contains prompt text, message content, or
@@ -135,12 +267,21 @@ headers** — only routing metadata:
 ```
 
 `decision` is one of: `routed`, `cache-hit`, `already-light`, `pinned`,
-`midflight-passthrough`, `malformed-passthrough`, `fallback` (adds
-`fallback_reason`, e.g. `provider-key-missing:<name>`). `provider` names the
+`midflight-passthrough`, `malformed-passthrough`, `rewrite-rejected-passthrough`
+(session pinned to passthrough after a rewrite drew a 400), `capability-mismatch` (declined
+pre-flight because the target cannot serve the request's content unchanged; adds
+`capability_blockers`), `fallback` (adds `fallback_reason`, e.g. `provider-key-missing:<name>`
+or `rewrite-rejected-400`). `provider` names the
 provider the request was routed to (`anthropic` for all passthrough/fallback).
 
 ## Known limitations
 
+- **The light tier yields little to no savings for a *stock* Claude Code session today** —
+  Claude Code tailors each request to its configured model (betas, `output_config.effort`,
+  adaptive `thinking`, a mid-conversation `role:"system"` message), and `claude-haiku-4-5`
+  rejects several, so those turns are declined pre-flight (`capability-mismatch`) and pass
+  through on the original model. Real savings require tiering across models of **comparable
+  capability**. See *Model-param reconciliation & the capability gate*.
 - `message_start.model` in the streamed response reports the **routed** model, not
   what the client asked for. Tools that key off it will see the rewritten model.
 - The classifier call **consumes your subscription/API quota** (one tiny Haiku
