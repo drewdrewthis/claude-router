@@ -1,0 +1,1 @@
+# claude-router PR#4 2026-07-09T21:51:54Z — hardening code done; BLOCKED on Drew: live-proof needs NVIDIA_API_KEY (+ #6 needs OPENCODE_ZEN + LANGWATCH keys + PR#4-first call). Resume when keys provided.
