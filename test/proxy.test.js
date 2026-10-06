@@ -705,6 +705,61 @@ test('modality gate: an image request routed to a text-only openai provider fail
   delete process.env.MOCKAI_KEY;
 });
 
+test('privacy gate: a request containing a secret routed to a text provider fails open to Anthropic', async () => {
+  // Key PRESENT on purpose: proves the PRIVACY gate diverts, not a missing credential.
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'standard' }); // classifier + Anthropic fallback upstream
+  const prov = await startProviderMock(({ res }) => {
+    // Must never be reached. If it is, answer so the test fails on the routing assert (not a hang).
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id: 'cmpl-should-not-happen',
+        choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'leaked' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      })
+    );
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({
+    config: providerConfig(prov.url, {
+      tiers: { light: 'claude-haiku-4-5', standard: 'mockai,demo-model', heavy: 'claude-opus-4-8' },
+    }),
+    upstream: anth.url,
+    logFile,
+  });
+
+  // Canonical fake AWS access key id -> hasSensitiveContent matches -> privacy gate fires.
+  await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'Is this AWS key still active? AKIAIOSFODNN7EXAMPLE' }],
+    }),
+  });
+
+  // Served by ANTHROPIC (fail-closed), NOT the text provider that would have seen the secret.
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1, 'the secret-bearing request must be served by the Anthropic upstream');
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet'); // ORIGINAL model
+  assert.strictEqual(prov.requests.length, 0, 'the third-party provider must never receive a secret');
+
+  // Decision log records an Anthropic privacy fallback.
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.strictEqual(last.provider, 'anthropic');
+  assert.ok(
+    typeof last.fallback_reason === 'string' && last.fallback_reason.startsWith('privacy:'),
+    `fallback_reason should start with 'privacy:', got ${JSON.stringify(last.fallback_reason)}`
+  );
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
 // ---------- hardening: provider timeout + runtime fail-open + non-SSE re-envelope ----------
 
 // Fully controllable OpenAI-compatible provider mock: the handler decides status,
@@ -908,6 +963,263 @@ test('non-stream provider that sends headers then stalls the body fails open to 
   assert.strictEqual(last.provider, 'anthropic');
   assert.strictEqual(last.routed_model, last.original_model);
   assert.match(last.fallback_reason, /provider-body|abort|provider-fetch/);
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+// ---------- forward() timeout (Anthropic passthrough leg) ----------
+
+// An upstream that accepts the request and then NEVER responds. Without a
+// time-to-headers timeout on forward(), the client socket hangs forever.
+function startBlackHoleUpstream() {
+  const sockets = [];
+  const server = http.createServer((req, res) => {
+    sockets.push(res);
+    req.on('data', () => {});
+    req.on('error', () => {});
+    res.on('error', () => {});
+    // deliberately never writeHead / never end
+  });
+  return new Promise((r) => {
+    server.listen(0, '127.0.0.1', () =>
+      r({
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () =>
+          new Promise((rr) => {
+            for (const res of sockets) { try { res.destroy(); } catch {} }
+            server.close(rr);
+          }),
+      })
+    );
+  });
+}
+
+test('forward: a hung upstream aborts at upstreamTimeoutMs and returns 502, never hangs the client', async () => {
+  const hole = await startBlackHoleUpstream();
+  const srv = await startServer({
+    config: baseConfig({ upstreamTimeoutMs: 300 }),
+    upstream: hole.url,
+    logFile: tmpLog(),
+  });
+
+  const t0 = Date.now();
+  // already-haiku => passthrough, so this exercises forward() with no classifier call.
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 502);
+  const env = JSON.parse(r.body.toString('utf8'));
+  assert.strictEqual(env.type, 'error');
+  assert.ok(elapsed >= 250, `should have waited out the timeout, took ${elapsed}ms`);
+  assert.ok(elapsed < 5000, `should not have hung, took ${elapsed}ms`);
+
+  await srv.close();
+  await hole.close();
+});
+
+test('forward: the timeout bounds time-to-HEADERS only — a slow SSE body streams to completion', async () => {
+  // Headers land fast, then the body dribbles for well past upstreamTimeoutMs. A
+  // total-duration timeout would truncate this; a time-to-headers timeout must not.
+  const slow = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: one\n\n');
+      setTimeout(() => {
+        res.write('data: two\n\n');
+        res.end();
+      }, 400); // > upstreamTimeoutMs below
+    });
+  });
+  await new Promise((r) => slow.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${slow.address().port}`;
+
+  const srv = await startServer({
+    config: baseConfig({ upstreamTimeoutMs: 200 }),
+    upstream: url,
+    logFile: tmpLog(),
+  });
+
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  const body = r.body.toString('utf8');
+  assert.ok(body.includes('data: one'), 'first event missing');
+  assert.ok(body.includes('data: two'), 'stream was truncated by a total-duration timeout');
+
+  await srv.close();
+  await new Promise((rr) => slow.close(rr));
+});
+
+// ---------- bounded provider error-body read ----------
+
+test('provider 500 with an ENDLESS error body still fails open promptly (bounded read)', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  let stopped = false;
+  const prov = await startProviderMock(({ res }) => {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    const stop = () => { stopped = true; };
+    res.on('close', stop);
+    res.on('error', stop);
+    const pump = () => {
+      if (stopped || res.destroyed || res.writableEnded) return;
+      if (res.write('x'.repeat(65536))) setImmediate(pump);
+      else res.once('drain', pump);
+    };
+    pump();
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile });
+
+  const t0 = Date.now();
+  // stream:true is the path that previously cleared the abort timer BEFORE reading the
+  // error body, leaving the read unbounded in BOTH time and bytes.
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      stream: true,
+      messages: [{ role: 'user', content: 'route then 500 forever' }],
+    }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 200, 'client must get the Anthropic fallback, not a hang');
+  assert.ok(elapsed < 10000, `fail-open took ${elapsed}ms — the error body was not bounded`);
+
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const last = lines[lines.length - 1];
+  assert.strictEqual(last.decision, 'fallback');
+  assert.strictEqual(last.fallback_reason, 'provider-http-500');
+  assert.ok(stopped, 'the router must cancel the error body rather than drain it');
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+// ---------- tool-name limit, end to end through the provider leg ----------
+
+test('long MCP tool name: <=64 chars on the wire, original name restored to the client', async () => {
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const LONG = 'mcp__langwatch_platform__list_simulation_runs_for_a_given_scenario_set';
+  assert.ok(LONG.length > 64);
+
+  const anth = await startMock({ label: 'heavy' });
+  let wireName = null;
+  const prov = await startProviderMock(({ req, res }) => {
+    const chunks = [];
+    // body already consumed by startProviderMock; re-read from its record below
+    void req;
+    void chunks;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id: 'cmpl-tool',
+        // Provider echoes the mangled name back, and reports finish_reason "stop"
+        // alongside tool_calls exactly as NVIDIA does.
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: { tool_calls: [{ id: 'call_1', function: { name: wireName, arguments: '{"a":1}' } }] },
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 1 },
+      })
+    );
+  });
+
+  // Patch: capture the wire name from the provider's received request before replying.
+  const origPush = prov.requests.push.bind(prov.requests);
+  prov.requests.push = (rec) => {
+    try {
+      const j = JSON.parse(rec.body.toString('utf8'));
+      if (j.tools && j.tools[0]) wireName = j.tools[0].function.name;
+    } catch {}
+    return origPush(rec);
+  };
+
+  const srv = await startServer({ config: providerConfig(prov.url), upstream: anth.url, logFile: tmpLog() });
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'call the tool' }],
+      tools: [{ name: LONG, description: 'd', input_schema: { type: 'object' } }],
+    }),
+  });
+
+  assert.strictEqual(r.status, 200);
+  assert.ok(wireName, 'provider never saw a tools[] entry');
+  assert.ok(wireName.length <= 64, `provider saw a ${wireName.length}-char name`);
+  assert.match(wireName, /^[a-zA-Z0-9_-]{1,64}$/);
+
+  const out = JSON.parse(r.body.toString('utf8'));
+  assert.strictEqual(out.content[0].type, 'tool_use');
+  assert.strictEqual(out.content[0].name, LONG, 'client must see the name it declared');
+  assert.strictEqual(out.stop_reason, 'tool_use', 'finish_reason "stop" + tool_calls must map to tool_use');
+
+  await srv.close();
+  await anth.close();
+  await prov.close();
+  delete process.env.MOCKAI_KEY;
+});
+
+test('the default upstreamTimeoutMs sits BELOW undici headersTimeout, or it can never fire', () => {
+  // undici (Node's fetch engine) aborts at its own headersTimeout (300s, verified on
+  // this runtime as UND_ERR_HEADERS_TIMEOUT). A default at or above that is inert.
+  const { DEFAULTS } = require('../router');
+  assert.ok(
+    DEFAULTS.upstreamTimeoutMs < 300000,
+    `upstreamTimeoutMs default ${DEFAULTS.upstreamTimeoutMs} >= undici's 300000ms headersTimeout — it would never fire`
+  );
+});
+
+test('stream requested but provider sends non-SSE headers then STALLS the body fails open within timeout', async () => {
+  // Regression for the sibling of the error-body hang: on the stream path we used to
+  // clear the timer and writeHead(200) BEFORE reading a non-SSE JSON body. A provider
+  // that answered stream:true with content-type: application/json and then stalled hung
+  // the client forever with fail-open no longer possible.
+  process.env.MOCKAI_KEY = 'provider-secret-key';
+  const anth = await startMock({ label: 'heavy' });
+  const prov = await startProviderMock(({ res }) => {
+    // Non-SSE content-type, headers sent, body never completes.
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"choices":');
+    // never res.end()
+  });
+  const logFile = tmpLog();
+  const srv = await startServer({
+    config: providerConfig(prov.url, { providerTimeoutMs: 400 }),
+    upstream: anth.url,
+    logFile,
+  });
+
+  const t0 = Date.now();
+  const r = await request(srv.port, {
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-3-5-sonnet', stream: true, messages: [{ role: 'user', content: 'route then stall' }] }),
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.strictEqual(r.status, 200, 'client must get the Anthropic fallback, not a hang');
+  assert.ok(elapsed >= 350 && elapsed < 8000, `should fail open near providerTimeoutMs, took ${elapsed}ms`);
+  const fwd = anth.forwarded();
+  assert.strictEqual(fwd.length, 1, 'exactly one Anthropic fallback');
+  assert.strictEqual(safeModel(fwd[0].body.toString('utf8')), 'claude-3-5-sonnet');
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.strictEqual(lines[lines.length - 1].fallback_reason, 'provider-body:mockai');
 
   await srv.close();
   await anth.close();

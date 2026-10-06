@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { decide, hasNonTextContent, buildDigest } = require('../lib/decide');
+const { decide, hasNonTextContent, hasSensitiveContent, buildDigest } = require('../lib/decide');
 
 const TIERS = { light: 'claude-haiku-4-5', standard: 'claude-sonnet-5', heavy: 'claude-opus-4-8' };
 
@@ -314,4 +314,270 @@ test('buildDigest: meta line carries an image count (images=1 with an image, ima
 
   const textBody = { messages: [{ role: 'user', content: 'just text' }] };
   assert.match(buildDigest(textBody, 7), /\[meta est_tokens=7 tools=0 thinking=false images=0\]/);
+});
+
+// ---------- privacy: high-confidence secret detection (fail-closed gate input) ----------
+
+test('hasSensitiveContent: true for AWS key / PEM private-key header / SSN; false for benign code + normal prompt', () => {
+  // TRUE: high-confidence credential shapes (canonical fakes only)
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: 'Is this AWS key still active? AKIAIOSFODNN7EXAMPLE' }] }),
+    true
+  );
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: [{ type: 'text', text: '-----BEGIN RSA PRIVATE KEY-----' }] }] }),
+    true
+  );
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: 'my ssn is 123-45-6789, can you validate the format?' }] }),
+    true
+  );
+
+  // the system prompt is scanned too
+  assert.strictEqual(
+    hasSensitiveContent({ system: 'deploy context: AKIAIOSFODNN7EXAMPLE', messages: [{ role: 'user', content: 'hi' }] }),
+    true
+  );
+  // text nested inside a tool_result is scanned too
+  assert.strictEqual(
+    hasSensitiveContent({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: 'grep found AKIAIOSFODNN7EXAMPLE' }] },
+          ],
+        },
+      ],
+    }),
+    true
+  );
+
+  // FALSE: benign code + a normal coding prompt (no credential shapes)
+  assert.strictEqual(hasSensitiveContent({ messages: [{ role: 'user', content: 'const x = skateboard;' }] }), false);
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'user', content: 'Write a debounce function in TypeScript with a configurable delay.' }] }),
+    false
+  );
+
+  // malformed / missing fields never throw -> false
+  assert.strictEqual(hasSensitiveContent({}), false);
+  assert.strictEqual(hasSensitiveContent(null), false);
+  assert.strictEqual(hasSensitiveContent({ messages: 'nope' }), false);
+});
+
+test('decide: stashes hasSensitive on the decision (true when a secret is present, false otherwise)', async () => {
+  const withSecret = await decide({
+    rawBody: Buffer.from(JSON.stringify({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'check AKIAIOSFODNN7EXAMPLE' }] })),
+    config: baseConfig(),
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+  });
+  assert.strictEqual(withSecret.hasSensitive, true);
+
+  const clean = await decide({
+    rawBody: Buffer.from(JSON.stringify({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'refactor this function' }] })),
+    config: baseConfig(),
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+  });
+  assert.strictEqual(clean.hasSensitive, false);
+});
+
+// ---------- cache key: domain separation + session scoping ----------
+
+const { cacheKey, sessionIdFrom } = require('../lib/decide');
+
+test('cacheKey: concatenation-ambiguous field splits produce DIFFERENT keys', () => {
+  // The old key was sha256(sysText + firstContent), so ("ab","c") and ("a","bc")
+  // hashed identically. Encoding the fields unambiguously is the fix.
+  assert.notStrictEqual(cacheKey(null, 'ab', 'c'), cacheKey(null, 'a', 'bc'));
+  assert.notStrictEqual(cacheKey(null, '', 'xy'), cacheKey(null, 'x', 'y'));
+});
+
+test('cacheKey: same session + same content is stable; different sessions diverge', () => {
+  assert.strictEqual(cacheKey('s1', 'sys', 'first'), cacheKey('s1', 'sys', 'first'));
+  assert.notStrictEqual(cacheKey('s1', 'sys', 'first'), cacheKey('s2', 'sys', 'first'));
+  // A null session degrades to the content-only key, and is not the same as "no session".
+  assert.strictEqual(cacheKey(null, 'sys', 'first'), cacheKey('', 'sys', 'first'));
+});
+
+test('sessionIdFrom: header wins, metadata.user_id is the fallback, else null', () => {
+  const meta = { metadata: { user_id: 'uid-json-blob' } };
+  assert.strictEqual(sessionIdFrom(meta, { 'x-claude-code-session-id': 'sess-1' }), 'sess-1');
+  assert.strictEqual(sessionIdFrom(meta, {}), 'uid-json-blob');
+  assert.strictEqual(sessionIdFrom({}, {}), null);
+  assert.strictEqual(sessionIdFrom(null, null), null);
+  // Empty strings are not identities.
+  assert.strictEqual(sessionIdFrom({ metadata: { user_id: '' } }, { 'x-claude-code-session-id': '' }), null);
+});
+
+test('two DIFFERENT sessions with identical bodies each classify (no cross-session cache hit)', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = (sessionId) => ({
+    rawBody: bodyBuf({
+      model: 'claude-sonnet-4',
+      system: 'You are Claude Code.',
+      messages: [{ role: 'user', content: 'hello' }],
+    }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'heavy';
+    },
+    now: fixedClock(),
+    cache,
+    headers: { 'x-claude-code-session-id': sessionId },
+  });
+
+  const a = await decide(req('session-aaa'));
+  const b = await decide(req('session-bbb'));
+
+  assert.strictEqual(a.log.decision, 'routed');
+  assert.strictEqual(b.log.decision, 'routed', 'session B must not inherit session A cache entry');
+  assert.strictEqual(calls, 2);
+  assert.notStrictEqual(a.log.key, b.log.key);
+  assert.strictEqual(cache.size, 2);
+});
+
+test('the SAME session still gets stickiness (one classify, then cache-hit)', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = () => ({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'hello' }] }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'heavy';
+    },
+    now: fixedClock(),
+    cache,
+    headers: { 'x-claude-code-session-id': 'session-aaa' },
+  });
+  const a = await decide(req());
+  const b = await decide(req());
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(a.log.decision, 'routed');
+  assert.strictEqual(b.log.decision, 'cache-hit');
+});
+
+test('metadata.user_id scopes the cache when no session header is present', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = (uid) => ({
+    rawBody: bodyBuf({
+      model: 'claude-sonnet-4',
+      messages: [{ role: 'user', content: 'hello' }],
+      metadata: { user_id: uid },
+    }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'light';
+    },
+    now: fixedClock(),
+    cache,
+  });
+  await decide(req('{"session_id":"one"}'));
+  await decide(req('{"session_id":"two"}'));
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(cache.size, 2);
+});
+
+test('no session identity at all -> previous content-only behaviour (still sticky)', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const req = () => ({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'hello' }] }),
+    config: baseConfig(),
+    classify: async () => {
+      calls++;
+      return 'light';
+    },
+    now: fixedClock(),
+    cache,
+  });
+  await decide(req());
+  const b = await decide(req());
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(b.log.decision, 'cache-hit');
+});
+
+test('the session id is never written into the decision log', async () => {
+  const d = await decide({
+    rawBody: bodyBuf({ model: 'claude-sonnet-4', messages: [{ role: 'user', content: 'hi' }] }),
+    config: baseConfig(),
+    classify: async () => 'light',
+    now: fixedClock(),
+    cache: new Map(),
+    headers: { 'x-claude-code-session-id': 'super-secret-session' },
+  });
+  assert.ok(!JSON.stringify(d.log).includes('super-secret-session'));
+});
+
+// ---------- privacy gate: tool_use.input is on the provider wire, so it must be scanned ----------
+
+test('hasSensitiveContent: a secret inside tool_use.input trips the gate (Bash/Write payloads)', () => {
+  // Claude Code's dominant tool shape puts the payload in `input`, which has no `.text`
+  // field — and translate.js serializes it verbatim into tool_calls[].function.arguments.
+  const bash = {
+    messages: [
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'Bash',
+          input: { command: 'echo AKIAIOSFODNN7EXAMPLE >> ~/.aws/credentials' } },
+      ]},
+    ],
+  };
+  assert.strictEqual(hasSensitiveContent(bash), true);
+
+  const write = {
+    messages: [
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 't2', name: 'Write',
+          input: { file_path: '/x/.env', content: 'GH_TOKEN=ghp_' + 'A'.repeat(36) } },
+      ]},
+    ],
+  };
+  assert.strictEqual(hasSensitiveContent(write), true);
+});
+
+test('hasSensitiveContent: a benign tool_use.input does NOT trip the gate', () => {
+  assert.strictEqual(
+    hasSensitiveContent({
+      messages: [{ role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls -la && npm test' } },
+      ]}],
+    }),
+    false
+  );
+});
+
+test('hasSensitiveContent: unserializable tool_use.input degrades to false, never throws', () => {
+  const circular = { a: 1 };
+  circular.self = circular;
+  assert.strictEqual(
+    hasSensitiveContent({ messages: [{ role: 'assistant', content: [{ type: 'tool_use', input: circular }] }] }),
+    false
+  );
+});
+
+test('everything translate.js puts on the wire is covered by the gate (contract, not sampling)', () => {
+  // The gate's scan surface must equal translate.js's forwarding surface. If a future
+  // block type starts being forwarded, this test is where the omission should surface.
+  const KEY = 'AKIAIOSFODNN7EXAMPLE';
+  const carriers = [
+    ['system string', { system: `key ${KEY}`, messages: [] }],
+    ['system blocks', { system: [{ type: 'text', text: `key ${KEY}` }], messages: [] }],
+    ['user string', { messages: [{ role: 'user', content: `key ${KEY}` }] }],
+    ['user text block', { messages: [{ role: 'user', content: [{ type: 'text', text: `key ${KEY}` }] }] }],
+    ['tool_result string', { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: `key ${KEY}` }] }] }],
+    ['tool_result blocks', { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: [{ type: 'text', text: `key ${KEY}` }] }] }] }],
+    ['tool_use input', { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: { command: KEY } }] }] }],
+  ];
+  for (const [label, body] of carriers) {
+    assert.strictEqual(hasSensitiveContent(body), true, `${label} must trip the privacy gate`);
+  }
 });

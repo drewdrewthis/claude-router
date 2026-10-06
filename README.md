@@ -63,6 +63,7 @@ whose own credentials also fail.
 | `classifierTimeoutMs` | `3000` | hard timeout on the classifier call (covers cold TLS handshake + OAuth Haiku latency; harmless in session mode since it fires once per session) |
 | `maxHaikuInputTokens` | `150000` | above this (est. bytes/4), the `light` tier is forbidden and upgraded to `standard` |
 | `providerTimeoutMs` | `30000` | hard timeout on the OpenAI-compatible provider fetch. For a **streaming** request it bounds only time-to-response-headers, so a long streaming body is never clipped. For a **non-stream** request it *also* bounds the response-body read, so a provider that sends headers then stalls its body still **fails open to Anthropic**. On timeout or provider error (before any client bytes stream) the request fails open |
+| `upstreamTimeoutMs` | `240000` | hard timeout on the **Anthropic passthrough** fetch. Bounds only time-to-response-headers, then unbinds — a long SSE body is never clipped. On expiry the client gets a clean `502`. **Ceiling:** undici (Node's `fetch` engine) enforces its own `headersTimeout` of `300000` ms and stdlib-only code cannot raise it, so any value ≥ `300000` never fires and is warned about at startup. The default sits below it deliberately. The body-idle half of the guarantee is undici's `bodyTimeout` (also `300000` ms, inter-chunk — the nginx `proxy_read_timeout` analogue), so the router does not hand-roll one |
 | `upstream` | `https://api.anthropic.com` | forward target |
 | `allowedUpstreamHosts` | `[]` | extra hostnames allowed as `upstream` (see below) |
 | `port` | `3456` | listen port |
@@ -150,16 +151,24 @@ provider the request was routed to (`anthropic` for all passthrough/fallback).
 
 ### Cross-provider translation limitations
 
-- **`thinking` blocks are dropped when routing to a non-Anthropic provider.** Those
-  models have no Anthropic-style thinking, so neither the request-level `thinking`
-  parameter nor any `thinking` blocks in assistant history are forwarded (they are
-  simply not copied during translation). Replay is unaffected: OpenAI reconstructs
-  conversational context from the surrounding text and `tool_calls`, not from a
-  thinking transcript.
-- **Tool names pass through unchanged.** A provider that enforces OpenAI's 64-char
-  function-name limit (`^[a-zA-Z0-9_-]{1,64}$`) may reject long MCP tool names such as
-  `mcp__server__some_long_tool`. The fix — a truncate-on-request / restore-on-response
-  name map — is deferred until a provider is confirmed to actually enforce the limit.
+- **`thinking` blocks are dropped when routing to a non-Anthropic provider, in both
+  directions.** On the request leg neither the `thinking` parameter nor any
+  `thinking` / `redacted_thinking` blocks in assistant history are forwarded. On the
+  response leg a reasoning model's `reasoning_content` (DeepSeek-R1, QwQ — including
+  over NVIDIA NIM) is **not** re-emitted as an Anthropic `thinking` block. That block
+  carries a `signature` only Anthropic can mint; a fabricated one is echoed back by the
+  client on the next turn, and Anthropic rejects a modified thinking block with
+  `400 invalid_request_error` — which would break the very next turn that fails open.
+  Losing the reasoning text is strictly safer than poisoning the conversation.
+  (LiteLLM and claude-code-router both synthesize `signature: ""`/`undefined` here;
+  we deliberately do not.)
+- **Long tool names are mangled on the wire and restored on the way back.** OpenAI
+  enforces `^[a-zA-Z0-9_-]{1,64}$` on function names, while Claude Code routinely emits
+  `mcp__server__some_long_tool`. Names over the limit (or with illegal characters) are
+  sanitized, truncated, and given an 8-hex-char content-hash suffix — applied
+  consistently to `tools[]`, `tool_choice`, and historical `tool_use` blocks — then
+  mapped back to the name the client declared on the response leg (non-stream and
+  streaming). A name that is already legal is passed through byte-identical.
 - **Prompt caching does not apply cross-provider.** Anthropic's model-scoped cache
   is meaningless once a tier lands on another provider; session-stickiness still
   avoids thrashing within a session.
@@ -170,6 +179,18 @@ provider the request was routed to (`anthropic` for all passthrough/fallback).
   OpenAI `tool_calls` / `role:"tool"` messages, but small open models may emit
   malformed tool-call JSON; unparseable arguments degrade to `input: {}` (logged
   to stderr) rather than failing the response.
+- **`stop_reason` follows the CONTENT, not the provider's `finish_reason`.** A provider
+  that emits `tool_calls` alongside `finish_reason: "stop"` (NVIDIA does exactly this —
+  see `docs/live-nvidia-toolcall-proof.txt` `[TOOL-4]`) would otherwise map to
+  `end_turn`, and the client would end the turn instead of executing the tool. If any
+  `tool_use` block was emitted, `stop_reason` is `tool_use`. `max_tokens` still wins,
+  because a truncated tool call is a truncation first.
+- **Cache-token accounting is translated, not passed through.** OpenAI's
+  `prompt_tokens` INCLUDES cache hits; Anthropic's `input_tokens` excludes tokens both
+  read from *and* used to create a cache. The router reports
+  `input_tokens = max(prompt_tokens - cache_read - cache_creation, 0)` and surfaces
+  `cache_read_input_tokens` / `cache_creation_input_tokens` when (and only when) the
+  provider reports them.
 - Response `message_start.model` reports the routed `provider/model` string.
 - **Runtime fail-open to Anthropic.** If a provider fetch throws, times out
   (`providerTimeoutMs` — which bounds time-to-response-headers for a streaming request
@@ -191,3 +212,9 @@ provider the request was routed to (`anthropic` for all passthrough/fallback).
   `stream:true` and returns a single JSON body, it is buffered and re-emitted as a
   single-shot Anthropic event stream, so a streaming client still receives a valid,
   non-empty stream (an unparseable body yields a valid, empty terminated stream).
+
+## Evaluation
+
+An offline routing eval lives in [`eval/`](eval/): it drives the shipped `decide()` / `classify()` product code over a small labeled suite (light / standard / heavy plus modality and privacy cases) at the **decision level only** — no provider is ever contacted — authenticating the classifier with the local Max OAuth token. Run it with `node eval/stage1-routing.js`.
+
+**Status:** the routing brain is validated offline (~82% tier accuracy, heavy-tier detection reliable, deterministic at `temperature: 0`). Free-model *adequacy* and end-to-end answer quality are **not** yet tested. A **fail-closed secret gate** now diverts any request whose text carries a high-confidence credential (API key, token, PEM private key, SSN) to Anthropic before it can reach a third-party provider — the same fail-closed pattern as the modality gate, checked *before* the provider-key check so it holds even with a valid provider key. The scan covers **everything the translator forwards**: the system prompt, message text, `tool_result` text, and — critically — `tool_use.input` (a `Bash` command or `Write`/`Edit` payload is serialized onto the provider wire and is where a real secret is most likely to hide). **Semantic PII** (names, addresses, free-form secrets) is not yet detected and can still route to a free provider on complexity alone.

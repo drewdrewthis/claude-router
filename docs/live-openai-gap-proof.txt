@@ -1,0 +1,42 @@
+=== claude-router LIVE OpenAI gap-closing proof (real API, real translate.js) ===
+captured 2026-07-09  model gpt-4o-mini  endpoint https://api.openai.com/v1/chat/completions
+translate.js exports exercised: requestAnthropicToOpenai, toOpenaiToolName, toolNameMap,
+  mapToolChoice, responseOpenaiToAnthropic, stopReasonFor, usageToAnthropic
+
+WHY THIS EXISTS: the earlier NVIDIA capture (docs/live-nvidia-toolcall-proof.txt) predates the
+round-2 fixes and used the short legal tool name `get_weather`, so it never exercised (a) the
+64-char tool-name limit fix nor (b) the stop_reason fix. This capture closes that gap against a
+live OpenAI-compatible provider. NVIDIA's endpoint is OpenAI-compatible, so this validates the same
+translation leg; translate.js is called directly, as in the NVIDIA proof (no classifier/Anthropic leg).
+
+[MANGLE] requestAnthropicToOpenai turned a 70-char tool name (> the 64 limit) into a legal wire name:
+         "mcp__langwatch_platform__list_simulation_runs_for_a_giv_8f7ea375"
+         len=64  legal(^[A-Za-z0-9_-]{1,64}$)=true  changed=true  tool_choice name matches tools[] name=true
+         (sanitize + truncate to 55 + "_" + 8-hex sha256(originalName) suffix)
+
+[CONTROL] NEGATIVE CONTROL — send the RAW 70-char name (fix bypassed) -> OpenAI HTTP 400:
+          "Invalid 'tool_choice.function.name': string too long. Expected a string with maximum
+           length 64, but got a string with length 70 instead."
+          => the 64-char limit is REAL and provider-enforced; the fix is load-bearing, not cosmetic.
+
+[FIXED-1] mangled name -> OpenAI HTTP 200
+[FIXED-2] OpenAI finish_reason="stop"  tool_calls=1  echoed name == the mangled name (true)
+          (note: gpt-4o-mini reports finish_reason:"stop" WITH a tool_call — the SAME quirk NVIDIA
+           shows in docs/live-nvidia-toolcall-proof.txt [TOOL-4])
+[FIXED-3] responseOpenaiToAnthropic restored the FULL original 70-char name:
+          "mcp__langwatch_platform__list_simulation_runs_for_a_given_scenario_set"  (restored===original=true)
+          stop_reason="tool_use"  <-- THE FIX. Pre-fix mapFinish maps finish_reason:"stop" -> "end_turn",
+          so an Anthropic client ENDS THE TURN instead of executing the tool. stopReasonFor() promotes it
+          to "tool_use" because tool_use content blocks were emitted.
+          tool input={"city":"Paris"}  usage={"input_tokens":102,"output_tokens":5}
+
+[TEXT] "Reply with exactly the single word: PONG" -> OpenAI HTTP 200 -> text "PONG"  stop_reason=end_turn
+
+VERDICT: ALL GAP ASSERTIONS PASS against live OpenAI.
+
+STILL NOT LIVE-PROVEN (honest scope):
+  - NVIDIA-specifically: not re-run this round (its key last session was ephemeral, not persisted).
+    Re-run = point host at integrate.api.nvidia.com + a NIM model, with NVIDIA_API_KEY exported.
+  - #6 reasoning_content DROP: needs a reasoning model (DeepSeek-R1 / QwQ / NVIDIA NIM reasoning);
+    gpt-4o-mini emits no reasoning_content. Still unit-tested only.
+  - #4 streaming tool-index: this capture is non-streaming (the NVIDIA proof covers the streaming leg).
